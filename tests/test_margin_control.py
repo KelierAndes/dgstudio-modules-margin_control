@@ -270,7 +270,8 @@ class GuardSensorTests(unittest.TestCase):
     def test_cycle_limit_triggers_release_then_restarts(self):
         guard = self._guard(ramp_s=0.0, cooldown_s=5.0,
                             recovery_threshold=20.0, cycle_limit=2,
-                            stim_strength=60, release_s=15.0)
+                            stim_strength=60, assist_strength=80,
+                            release_s=15.0)
         # 第 1 轮：到边 → 冷静 → 恢复（未达上限，回刺激）
         guard.step(10.0, None, True, now=0.0)
         guard.step(45.0, None, True, now=1.0)
@@ -282,8 +283,8 @@ class GuardSensorTests(unittest.TestCase):
         self.assertEqual((guard.phase, guard.cycles), (PHASE_COOL, 2))
         guard.step(5.0, None, True, now=30.0)
         self.assertEqual(guard.phase, PHASE_RELEASE)
-        # 助力并入刺激器：释放期以刺激器强度持续输出（不爬升）
-        self.assertEqual(guard.outputs(30.0), (60, 0))
+        # 助力强度经刺激器变量输出（不爬升）
+        self.assertEqual(guard.outputs(30.0), (80, 0))
         # 释放计时（15s）满 → 循环计数清零、回到刺激
         guard.step(5.0, None, True, now=44.0)
         self.assertEqual(guard.phase, PHASE_RELEASE)
@@ -319,7 +320,8 @@ class GuardAppTests(unittest.TestCase):
         return EdgeGuard(MarginConfig({"mode": "app", **overrides}))
 
     def test_state_map(self):
-        guard = self._guard(ramp_s=0.0, stim_strength=60)
+        guard = self._guard(ramp_s=0.0, stim_strength=60,
+                            assist_strength=80)
         guard.step(10.0, 1, True, now=0.0)
         self.assertEqual(guard.phase, PHASE_STIM)
         self.assertEqual(guard.outputs(0.0), (60, 0))
@@ -331,7 +333,7 @@ class GuardAppTests(unittest.TestCase):
         self.assertEqual(guard.cycles, 1)         # 判定不计新循环
         guard.step(10.0, 4, True, now=3.0)
         self.assertEqual(guard.phase, PHASE_RELEASE)
-        self.assertEqual(guard.outputs(3.0), (60, 0))     # 刺激器持续输出
+        self.assertEqual(guard.outputs(3.0), (80, 0))     # 助力经刺激器输出
         # 会话回到刺激（新一轮）→ 循环计数清零
         guard.step(10.0, 1, True, now=4.0)
         self.assertEqual((guard.phase, guard.cycles), (PHASE_STIM, 0))
@@ -445,12 +447,12 @@ class BridgeTickTests(unittest.TestCase):
         self.assertEqual(commands.strength_calls, [])
 
     def test_cycle_limit_release_drives_stimulator_via_mapping(self):
-        """循环上限达成 → 释放期刺激器强度经映射行派发（助力已并入）。"""
+        """循环上限达成 → 释放期助力强度经刺激器变量映射派发。"""
         bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
                                     "cooldown_s": 0.0,
                                     "recovery_threshold": 20.0,
                                     "cycle_limit": 1,
-                                    "stim_strength": 60,
+                                    "assist_strength": 90,
                                     "release_s": 15.0},
                                    commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)                     # 刺激 60
@@ -459,13 +461,13 @@ class BridgeTickTests(unittest.TestCase):
         commands.state.slots["s_bmt"].pressure = 5.0
         bridge.tick_at(120.0)                     # 冷静期满 → 释放
         self.assertEqual(bridge.engine.signals["cycles"], 1)
-        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
+        self.assertEqual(_strength_by_channel(commands), {"A": 90, "B": 90})
         # 释放计时满 → 清零计数重新刺激（爬升从 0 开始）
         bridge2, commands2 = _bridge({"ramp_s": 0.0, "smooth": 0.0,
                                       "cooldown_s": 0.0,
                                       "recovery_threshold": 20.0,
                                       "cycle_limit": 1,
-                                      "stim_strength": 60,
+                                      "assist_strength": 90,
                                       "release_s": 15.0},
                                      commands=_commands(pressure=10.0))
         bridge2.tick_at(100.0)
@@ -474,9 +476,9 @@ class BridgeTickTests(unittest.TestCase):
         commands2.state.slots["s_bmt"].pressure = 5.0
         bridge2.tick_at(120.0)
         bridge2.tick_at(140.0)                    # 释放计时到
-        self.assertEqual((bridge2.engine.signals["cycles"],
-                          bridge2.engine.signals["stim_strength"]),
-                         (0, 60))
+        self.assertEqual(bridge2.engine.signals["cycles"], 0)
+        self.assertEqual(_strength_by_channel(commands2),
+                         {"A": 60, "B": 60})   # 回刺激强度
 
     def test_pause_zeroes_outputs_via_mapping(self):
         bridge, commands = _bridge({"ramp_s": 0.0},
@@ -562,7 +564,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.3.0")
+        self.assertEqual(meta["version"], "0.3.1")
         # 六个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
@@ -572,14 +574,14 @@ class PluginContractTests(unittest.TestCase):
         cfg = meta["config"]
         for key in ("mode", "edge_threshold", "recovery_threshold",
                     "cooldown_s", "stim_strength", "cool_strength",
-                    "ramp_s", "punish_strength", "punish_s",
-                    "release_s", "cycle_limit",
+                    "ramp_s", "assist_strength", "punish_strength",
+                    "punish_s", "release_s", "cycle_limit",
                     "smooth", "sensor_timeout_s", "sensor_slot",
                     "mappings"):
             self.assertIn(key, cfg)
         self.assertNotIn("pressure_pct", cfg)     # 已移除
         self.assertNotIn("phase", cfg)
-        self.assertNotIn("assist_strength", cfg)  # 已并入刺激器强度
+        self.assertIn("assist_strength", cfg)     # 配置项与刺激强度分离
         self.assertNotIn("output_slot", cfg)      # 已移除
         self.assertNotIn("deny_zap_s", cfg)       # 直呼动作已移除
         self.assertNotIn("release_fire_s", cfg)

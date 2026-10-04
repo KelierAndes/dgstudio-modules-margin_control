@@ -15,10 +15,10 @@
 * ``sensor`` 气压闭环：平滑气压升到「边缘阈值」判定到边，立即撤除刺激进入
   冷静期（惩罚时长内以惩罚器强度输出）；冷静满「冷静时长」且气压回落到
   「恢复阈值」以下才恢复刺激。循环达「循环上限」后进入释放期（刺激器以
-  刺激器强度持续输出），释放满「释放时长」循环计数清零重新开始。
+  助力强度持续输出），释放满「释放时长」循环计数清零重新开始。
 * ``app`` 跟随官方边控会话：DG-Lab 4.0 App（Socket V4）的边控玩法把
   ``edgeState`` 0-4 推给核心——1 刺激 → 维持刺激强度；2/3 冷静计时/判定 →
-  撤除刺激（惩罚窗口同 sensor）；4 允许高潮 → 刺激器持续输出；0 停止 → 待机。
+  撤除刺激（惩罚窗口同 sensor）；4 允许高潮 → 刺激器以助力强度持续输出；0 停止 → 待机。
 * ``off`` 不闭环，仅提供映射变量。
 """
 
@@ -56,9 +56,9 @@ PARAM_DEFS: dict[str, dict[str, str]] = {
     "pressure": {"label": "灵猫气压", "desc": "平滑后气压 (kPa)"},
     "edge": {"label": "官方边控状态", "desc": "App 边控会话 0-4：0 停止 / "
                                             "1 刺激 / 2 冷静计时 / 3 冷静判定 / 4 允许高潮"},
-    "stim_strength": {"label": "刺激器强度", "desc": "刺激期按爬升时长趋向刺激器"
-                                                   "强度，冷静期维持冷静强度，释放期持续输出"
-                                                   "刺激器强度，其余 0（0-200）"},
+    "stim_strength": {"label": "刺激器强度", "desc": "刺激期按爬升时长趋向刺激"
+                                                   "强度，冷静期维持冷静强度，释放期输出"
+                                                   "助力强度，其余 0（0-200）"},
     "punish_strength": {"label": "惩罚器强度", "desc": "到边进冷静后的惩罚输出，"
                                                      "惩罚时长内非零（0-200）"},
     "on_edge": {"label": "到边标志", "desc": "平滑气压 ≥ 边缘阈值时为 1"},
@@ -87,6 +87,7 @@ class MarginConfig(dict):
         "cooldown_s": 10.0,
         "stim_strength": 60,
         "cool_strength": 0,
+        "assist_strength": 80,
         "ramp_s": 3.0,
         "punish_strength": 100,
         "punish_s": 1.0,
@@ -184,8 +185,9 @@ class EdgeGuard:
     def outputs(self, now: float) -> tuple[int, int]:
         """本拍两路输出 ``(刺激器, 惩罚器)``：
 
-        * 刺激期 → 刺激器强度（爬升中）；冷静期 → 冷静强度；释放期 →
-          刺激器强度持续输出（原助力并入，立即满量不爬升）；待机 0。
+        * 刺激期 → 刺激强度（爬升中）；冷静期 → 冷静强度；释放期 →
+          助力强度（立即满量不爬升）——刺激/助力共用刺激器这一个映射
+          变量输出；待机 0。
         * 惩罚器：冷静期惩罚窗口内 → 惩罚器强度（映射行取最大值即惩罚
           优先），其余 0。
         """
@@ -196,7 +198,7 @@ class EdgeGuard:
                 if (self.punish_until > 0 and now < self.punish_until) else 0
             return max(0, self._i("cool_strength")), punish
         if self.phase == PHASE_RELEASE:
-            return max(0, self._i("stim_strength", 60)), 0
+            return max(0, self._i("assist_strength")), 0
         return 0, 0
 
     def step(self, pressure: float | None, edge: int | None,

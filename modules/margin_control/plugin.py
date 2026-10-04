@@ -5,7 +5,8 @@
 按配置模式跑闭环状态机，产出两路强度映射变量（刺激器 / 惩罚器）：
 
 * ``sensor`` 气压闭环：到边阈值撤除刺激 → 冷静期满且气压回落恢复；循环达
-  「循环上限」后进入释放期（刺激器持续输出），释放期满清零计数重新开始；
+  「循环上限」后进入释放期（助力强度经刺激器变量输出），释放期满清零
+  计数重新开始；
 * ``app`` 跟随官方边控会话：刺激/冷静/允许高潮四态驱动变量；
 * ``off`` 只提供映射变量。
 
@@ -21,10 +22,10 @@ META["config"] 声明全部配置项，宿主装载 config/margin_control.json �
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "description": "灵猫气压 / 官方边控会话 → 闭环边控：按气压阈值自动"
-                   "「刺激→到边→冷静→恢复」，循环达上限后释放（刺激器持续"
-                   "输出），或跟随 App 边控状态；设备控制只经映射表传递。",
+                   "「刺激→到边→冷静→恢复」，循环达上限后释放（助力强度经"
+                   "刺激器变量输出），或跟随 App 边控状态；设备控制只经映射表传递。",
     "settings_key": "margin_control",
     "default_enabled": False,
     "actions": ["margin_reset_pressure", "margin_guard_toggle"],
@@ -33,8 +34,8 @@ META = {
         "edge": {"label": "官方边控状态", "desc": "App 边控会话 0-4：0 停止 / "
                                                 "1 刺激 / 2 冷静计时 / 3 冷静判定 / 4 允许高潮"},
         "stim_strength": {"label": "刺激器强度", "desc": "刺激期按爬升时长趋向"
-                                                       "刺激器强度，冷静期维持冷静强度，释放期持续输出"
-                                                       "刺激器强度，其余 0（0-200）"},
+                                                       "刺激强度，冷静期维持冷静强度，释放期输出"
+                                                       "助力强度，其余 0（0-200）"},
         "punish_strength": {"label": "惩罚器强度", "desc": "到边进冷静后的惩罚"
                                                          "输出，惩罚时长内非零（0-200）"},
         "on_edge": {"label": "到边标志", "desc": "平滑气压 ≥ 边缘阈值时为 1"},
@@ -72,11 +73,10 @@ META = {
             "desc": "到边后至少冷静该时长，再等气压回落才恢复刺激",
         },
         "stim_strength": {
-            "label": "刺激器强度", "type": "int",
+            "label": "刺激强度", "type": "int",
             "default": 60, "min": 0, "max": 200,
             "group": "edge",
-            "desc": "刺激期目标强度，释放期（循环上限达成或 App「允许高潮」）"
-                    "持续输出的强度；经映射变量 {stim_strength} 落地"
+            "desc": "刺激期目标强度，经映射变量 {stim_strength} 落地"
                     "（波形/上限请在官方 App 或控制页调好）",
         },
         "cool_strength": {
@@ -84,6 +84,13 @@ META = {
             "default": 0, "min": 0, "max": 200,
             "group": "edge",
             "desc": "冷静期维持强度（0=完全撤除刺激）",
+        },
+        "assist_strength": {
+            "label": "助力强度", "type": "int",
+            "default": 80, "min": 0, "max": 200,
+            "group": "edge",
+            "desc": "释放期（循环上限达成或 App「允许高潮」）输出强度；"
+                    "与刺激强度共用映射变量 {stim_strength} 输出",
         },
         "ramp_s": {
             "label": "刺激爬升时长 (秒)", "type": "float",
