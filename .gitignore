@@ -7,3 +7,4 @@ __pycache__/
 modules/*/_deps/
 modules/*.downloading/
 modules/*.old/
+.zcodeignore
