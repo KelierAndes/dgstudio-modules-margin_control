@@ -2,15 +2,15 @@
 
 模块读取灵猫（BMTR）气压（0-60 kPa）与官方边控会话状态（DG-Lab 4.0 App
 经 Socket V4 上报的 ``edgeState`` 0-4，核心控制页「边控状态」同款语义），
-按配置模式跑闭环状态机，产出三路强度映射变量（刺激 / 惩罚 / 助力）：
+按配置模式跑闭环状态机，产出两路强度映射变量（刺激器 / 惩罚器）：
 
 * ``sensor`` 气压闭环：到边阈值撤除刺激 → 冷静期满且气压回落恢复；循环达
-  「循环上限」后进入释放期（助力输出），释放期满清零计数重新开始；
+  「循环上限」后进入释放期（刺激器持续输出），释放期满清零计数重新开始；
 * ``app`` 跟随官方边控会话：刺激/冷静/允许高潮四态驱动变量；
 * ``off`` 只提供映射变量。
 
 **设备控制只经映射表**：状态机不直接调用设备命令，全部输出由输入映射表
-行引用 ``{stim_strength}`` 等变量落地（默认行取三路强度最大值驱动 A/B
+行引用 ``{stim_strength}`` 等变量落地（默认行取两路强度最大值驱动 A/B
 强度，可改写为任意核心输入参数）。
 
 META["config"] 声明全部配置项，宿主装载 config/margin_control.json 时自动
@@ -21,26 +21,22 @@ META["config"] 声明全部配置项，宿主装载 config/margin_control.json �
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "灵猫气压 / 官方边控会话 → 闭环边控：按气压阈值自动"
-                   "「刺激→到边→冷静→恢复」，循环达上限后释放（助力输出），"
-                   "或跟随 App 边控状态；设备控制只经映射表传递。",
+                   "「刺激→到边→冷静→恢复」，循环达上限后释放（刺激器持续"
+                   "输出），或跟随 App 边控状态；设备控制只经映射表传递。",
     "settings_key": "margin_control",
     "default_enabled": False,
     "actions": ["margin_reset_pressure", "margin_guard_toggle"],
     "params": {
         "pressure": {"label": "灵猫气压", "desc": "平滑后气压 (kPa)"},
-        "pressure_pct": {"label": "气压百分比", "desc": "0-100（60 kPa 满量程，"
-                                                      "与控制页曲线一致）"},
         "edge": {"label": "官方边控状态", "desc": "App 边控会话 0-4：0 停止 / "
                                                 "1 刺激 / 2 冷静计时 / 3 冷静判定 / 4 允许高潮"},
-        "phase": {"label": "闭环阶段", "desc": "0 待机 / 1 刺激 / 2 冷静 / 3 释放"},
-        "stim_strength": {"label": "刺激强度", "desc": "刺激期按爬升时长趋向刺激期"
-                                                     "强度，冷静期维持冷静强度，其余 0（0-200）"},
-        "punish_strength": {"label": "惩罚强度", "desc": "到边进冷静后的惩罚输出，"
-                                                       "惩罚时长内非零（0-200）"},
-        "assist_strength": {"label": "助力强度", "desc": "释放期输出：App「允许高潮」"
-                                                       "或循环上限达成后（0-200）"},
+        "stim_strength": {"label": "刺激器强度", "desc": "刺激期按爬升时长趋向"
+                                                       "刺激器强度，冷静期维持冷静强度，释放期持续输出"
+                                                       "刺激器强度，其余 0（0-200）"},
+        "punish_strength": {"label": "惩罚器强度", "desc": "到边进冷静后的惩罚"
+                                                         "输出，惩罚时长内非零（0-200）"},
         "on_edge": {"label": "到边标志", "desc": "平滑气压 ≥ 边缘阈值时为 1"},
         "cycles": {"label": "边控循环", "desc": "当前轮「到边→冷静」计数；释放完成"
                                               "后清零重新计"},
@@ -76,11 +72,12 @@ META = {
             "desc": "到边后至少冷静该时长，再等气压回落才恢复刺激",
         },
         "stim_strength": {
-            "label": "刺激期强度", "type": "int",
+            "label": "刺激器强度", "type": "int",
             "default": 60, "min": 0, "max": 200,
             "group": "edge",
-            "desc": "刺激期目标强度 0-200，经映射变量 {stim_strength} 落地"
-                    "（刺激强度/波形/上限请在官方 App 或控制页调好）",
+            "desc": "刺激期目标强度，释放期（循环上限达成或 App「允许高潮」）"
+                    "持续输出的强度；经映射变量 {stim_strength} 落地"
+                    "（波形/上限请在官方 App 或控制页调好）",
         },
         "cool_strength": {
             "label": "冷静期强度", "type": "int",
@@ -95,7 +92,7 @@ META = {
             "desc": "进入刺激期从 0 缓升到目标强度，0=立即",
         },
         "punish_strength": {
-            "label": "惩罚强度", "type": "int",
+            "label": "惩罚器强度", "type": "int",
             "default": 100, "min": 0, "max": 200,
             "group": "edge",
             "desc": "判定到边的瞬间以该强度输出（经映射变量 "
@@ -106,13 +103,6 @@ META = {
             "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.5,
             "group": "edge",
             "desc": "惩罚输出的持续时长，0=关闭惩罚",
-        },
-        "assist_strength": {
-            "label": "助力强度", "type": "int",
-            "default": 80, "min": 0, "max": 200,
-            "group": "edge",
-            "desc": "释放期维持强度（经映射变量 {assist_strength}）：App "
-                    "「允许高潮」或循环上限达成后的助力输出",
         },
         "release_s": {
             "label": "释放时长 (秒)", "type": "float",
@@ -126,7 +116,7 @@ META = {
             "default": 0, "min": 0, "max": 99,
             "group": "edge",
             "desc": "边控循环达到该轮数后允许释放：冷静期满改为进入释放期，"
-                    "以助力强度输出；0=不限制（仅 sensor 模式）",
+                    "刺激器以刺激器强度持续输出；0=不限制（仅 sensor 模式）",
         },
         "smooth": {
             "label": "气压平滑", "type": "float",
@@ -146,21 +136,14 @@ META = {
             "group": "device",
             "desc": "留空用第一台灵猫（多台时在「控制」页查看 slot_id）",
         },
-        "output_slot": {
-            "label": "目标输出设备 (slot_id)", "type": "str", "default": "",
-            "group": "device",
-            "desc": "映射表强度派发的目标设备绑定（家族匹配才生效）；"
-                    "留空按家族用第一台输出设备",
-        },
         # ---- 两张映射表之输入表（纯输入模块，无输出表） ----
         "mappings": {
             "label": "输入映射表", "type": "list", "default": [],
             "group": "map", "rows": "in",
             "desc": "行 {param: 核心输入参数, expr: 表达式}，表达式以 "
-                    "{stim_strength} {punish_strength} {assist_strength} "
-                    "{pressure} 等引用边控变量（设备控制的唯一通道），"
-                    "结果取整钳制后派发；表留空用默认行（三路强度最大值"
-                    "驱动 A/B 强度）",
+                    "{stim_strength} {punish_strength} {pressure} "
+                    "等引用边控变量（设备控制的唯一通道），结果取整钳制后"
+                    "派发；表留空用默认行（刺激器/惩罚器最大值驱动 A/B 强度）",
         },
     },
 }
