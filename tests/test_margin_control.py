@@ -1,11 +1,10 @@
-"""灵猫边控联动模块单测。
+"""灵猫边控联动模块单测（事件流驱动架构）。
 
-覆盖：闭环状态机纯逻辑（红线/蓝线 + 持续判定 + 气压跳变 + 阈值自适应 +
-循环上限/持续时长释放、app 跟随官方边控状态 0-4、爬升与失联 fail-safe、
-惩罚窗口）、桥接器一拍推进（七个映射变量喂入 + 默认行刺激器/惩罚器最大
-值派发 + 停止经映射表归零）、映射表默认行与热更新、**设备控制只经映射
-表**（不直接调用 zap/fire/reset）、插件 META / link_params / 按键动作契约。
-不依赖真实设备（引擎命令层用假件记录派发）。
+覆盖：状态机事实产出（相位推进、到边/恢复/释放事件、app_N 会话事件、
+持续判定与跳变、失联 fail-safe）、事件流规则引擎（where 条件、set 表达式、
+定时回滚、顺序生效）、默认事件流行为（相位→刺激器输出、到边惩罚、阈值
+自适应、边控 5 轮释放、官方会话接线）、映射表派发与**设备控制只经映射
+表**、插件 META / link_params / 按键动作契约。不依赖真实设备。
 
 运行（模块仓库根目录）::
 
@@ -23,25 +22,20 @@ import _bootstrap  # noqa: F401  定位核心仓库并挂 sys.path
 from dglab.state import EngineState, Slot
 from dglab.waves import SILENT
 
-from modules.margin_control.bridge import (DEFAULT_MAPPINGS, PARAM_DEFS,
-                                           EdgeGuard, MarginBridge,
-                                           MarginConfig, PHASE_COOL,
-                                           PHASE_IDLE, PHASE_RELEASE,
-                                           PHASE_STIM)
+from modules.margin_control.bridge import (DEFAULT_MAPPINGS, EventStream,
+                                           PARAM_DEFS, EdgeGuard,
+                                           MarginBridge, MarginConfig,
+                                           PHASE_COOL, PHASE_IDLE,
+                                           PHASE_RELEASE, PHASE_STIM)
 from modules.margin_control.plugin import (MARGIN_CONFIG_DEFAULTS, META,
                                            MarginControlModule)
 
-# 状态机/桥接测试的公共兜底：关闭持续判定与跳变（除非显式覆盖），
-# 使既有时间线不受新判定条件默认值影响
+# 机器/桥接测试的公共兜底：关闭持续判定与跳变（除非显式覆盖）
 _FAST_JUDGE = {"edge_hold_s": 0.0, "recovery_hold_s": 0.0, "jump_rise": 0.0}
 
 
 class FakeCommands:
-    """引擎命令层假件：记录映射派发（不触碰真实设备）。
-
-    同时用于断言「设备控制只经映射表」：模块运行期除映射派发器适配的
-    set_strength / set_wave 外，不得出现 zap / fire / reset 等直呼。
-    """
+    """引擎命令层假件：记录映射派发（不触碰真实设备）。"""
 
     def __init__(self):
         self.state = EngineState(backend="ble")
@@ -50,12 +44,10 @@ class FakeCommands:
         self.state.slots["s_bmt"] = Slot(slot_id="s_bmt", name="灵猫",
                                          type="BMTR_010")
         self.strength_calls: list[tuple[str, int, str | None]] = []
-        self.zap_calls: list[tuple[str, float, str | None]] = []
+        self.zap_calls: list[tuple] = []
         self.fire_calls: list[tuple] = []
         self.reset_calls: list[tuple] = []
         self.selection = {"A": SILENT, "B": SILENT}
-
-    # ---- 状态 ----
 
     def get_state(self):
         return self.state
@@ -76,8 +68,6 @@ class FakeCommands:
 
     def wave_selection(self):
         return dict(self.selection)
-
-    # ---- 命令（同步记账 + 空协程） ----
 
     def set_strength(self, channel, value, slot_id=None):
         self.strength_calls.append((channel, int(value), slot_id))
@@ -144,11 +134,12 @@ def _commands(pressure: float | None = None,
 
 def _bridge(config: dict | None = None, commands: FakeCommands | None = None,
             clock: float = 100.0) -> tuple[MarginBridge, FakeCommands]:
-    """带假命令层的桥接器（时钟固定，测试里用 tick_at 手动推进）。"""
+    """带假命令层的桥接器（默认事件流来自 META 声明，时钟手动推进）。"""
     commands = commands or _commands()
     merged = dict(_FAST_JUDGE)
     merged.update(config or {})
-    bridge = MarginBridge(MarginConfig(merged), commands.get_state, commands)
+    bridge = MarginBridge(MarginConfig(merged, defaults=MARGIN_CONFIG_DEFAULTS),
+                          commands.get_state, commands)
     bridge.log = lambda msg: None
     bridge._clock = lambda: clock
     bridge.tick_at = lambda t: _advance(bridge, t)
@@ -156,13 +147,25 @@ def _bridge(config: dict | None = None, commands: FakeCommands | None = None,
 
 
 def _advance(bridge: MarginBridge, t: float) -> None:
-    """把时钟推进到 t 并跑一拍（映射派发同步记账，无真实协程）。"""
     bridge._clock = lambda: t
     bridge._tick()
 
 
+def _steps(bridge: MarginBridge, start: float, count: int,
+           delta: float = 0.1):
+    """按真实节拍间隔连续推进 count 拍。"""
+    t = start
+    for _ in range(count):
+        t += delta
+        bridge.tick_at(t)
+    return t
+
+
+def _set_pressure(commands: FakeCommands, value: float) -> None:
+    commands.state.slots["s_bmt"].pressure = value
+
+
 def _strength_by_channel(commands: FakeCommands) -> dict[str, int]:
-    """假件记录的各通道最新强度派发。"""
     out: dict[str, int] = {}
     for ch, value, _sid in commands.strength_calls:
         out[ch] = value
@@ -171,361 +174,321 @@ def _strength_by_channel(commands: FakeCommands) -> dict[str, int]:
 
 # ---------------------------------------------------------------- 状态机
 
-class GuardSensorTests(unittest.TestCase):
-    """sensor 模式：气压闭环（红线/蓝线判定 → 冷静 → 恢复 / 释放）。"""
+class GuardTests(unittest.TestCase):
+    """状态机事实产出：相位推进与事件（不做变量输出）。"""
 
-    def _guard(self, **overrides) -> EdgeGuard:
+    def _guard(self, **overrides):
         merged = dict(_FAST_JUDGE)
         merged.update(overrides)
-        return EdgeGuard(MarginConfig(merged))
+        vars = {"phase": 0.0, "red": 17.0, "blue": 15.0, "cycles": 0.0,
+                "release_req": 0.0, "phase_time": 0.0, "session_time": 0.0}
+        return EdgeGuard(MarginConfig(merged), vars), vars
 
-    def test_starts_stimulating_when_pressure_fresh(self):
-        guard = self._guard()
+    def test_fresh_pressure_enters_stim(self):
+        guard, vars = self._guard()
+        events = guard.step(5.0, None, True, now=0.0)
+        self.assertEqual(events, ["stim"])
+        self.assertEqual(vars["phase"], PHASE_STIM)
+
+    def test_crossing_red_emits_edge_and_counts(self):
+        guard, vars = self._guard()
         guard.step(5.0, None, True, now=0.0)
-        self.assertEqual(guard.phase, PHASE_STIM)
-        self.assertEqual(guard.outputs(0.0), (0, 0))      # 爬升起点
-
-    def test_stays_idle_without_fresh_pressure(self):
-        guard = self._guard()
-        guard.step(5.0, None, False, now=0.0)
-        self.assertEqual(guard.phase, PHASE_IDLE)
-        self.assertEqual(guard.outputs(0.0), (0, 0))
-
-    def test_stays_idle_in_off_mode(self):
-        guard = self._guard(mode="off")
-        guard.step(50.0, None, True, now=0.0)
-        self.assertEqual(guard.phase, PHASE_IDLE)
-        self.assertEqual(guard.outputs(0.0), (0, 0))
-
-    def test_crossing_threshold_cools_and_counts(self):
-        guard = self._guard(ramp_s=0.0)
-        guard.step(10.0, None, True, now=0.0)
-        self.assertEqual(guard.phase, PHASE_STIM)
-        self.assertEqual(guard.outputs(0.0)[0], 60)       # 刺激器强度
-        # 气压越过红线 17 → 冷静 + 记一次循环 + 撤除刺激
-        guard.step(41.0, None, True, now=1.0)
-        self.assertEqual(guard.phase, PHASE_COOL)
-        self.assertEqual(guard.cycles, 1)
-        self.assertEqual(guard.outputs(2.5), (0, 0))      # 惩罚窗口(1s)已过
-
-    # ---- 持续判定（官方「连续 N 秒高于红线/低于蓝线」） ----
+        events = guard.step(45.0, None, True, now=1.0)
+        self.assertIn("edge", events)
+        self.assertEqual(vars["phase"], PHASE_COOL)
+        self.assertEqual(vars["cycles"], 1)
 
     def test_edge_hold_requires_sustained_above(self):
-        guard = self._guard(edge_hold_s=2.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(20.0, None, True, now=1.0)     # 高于红线 1s → 未达
-        self.assertEqual(guard.phase, PHASE_STIM)
-        guard.step(20.0, None, True, now=2.5)     # 1.5s → 未达
-        self.assertEqual(guard.phase, PHASE_STIM)
-        guard.step(20.0, None, True, now=3.1)     # 2.1s ≥ 2 → 到边
-        self.assertEqual(guard.phase, PHASE_COOL)
-
-    def test_edge_hold_resets_when_below(self):
-        guard = self._guard(edge_hold_s=2.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(20.0, None, True, now=1.0)     # 高于 1s
-        guard.step(10.0, None, True, now=2.0)     # 回落清零
-        guard.step(20.0, None, True, now=3.0)     # 重新计 0s
-        self.assertEqual(guard.phase, PHASE_STIM)
-        guard.step(20.0, None, True, now=5.1)     # 连续 2.1s → 到边
-        self.assertEqual(guard.phase, PHASE_COOL)
-
-    def test_recovery_hold_requires_sustained_below(self):
-        guard = self._guard(recovery_hold_s=3.0, cooldown_s=0.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=1.0)     # 到边进冷静
-        guard.step(5.0, None, True, now=2.0)      # 低于蓝线 1s → 未达
-        self.assertEqual(guard.phase, PHASE_COOL)
-        guard.step(5.0, None, True, now=4.0)      # 2s → 未达
-        self.assertEqual(guard.phase, PHASE_COOL)
-        guard.step(5.0, None, True, now=5.1)      # 3.1s ≥ 3 → 恢复
-        self.assertEqual(guard.phase, PHASE_STIM)
-
-    # ---- 气压跳变（官方「气压短时间上升差值」） ----
+        guard, vars = self._guard(edge_hold_s=2.0)
+        guard.step(5.0, None, True, now=0.0)
+        guard.step(20.0, None, True, now=1.0)
+        self.assertEqual(vars["phase"], PHASE_STIM)     # 1s 未达
+        guard.step(10.0, None, True, now=2.0)           # 回落清零
+        guard.step(20.0, None, True, now=3.0)           # 重新计
+        self.assertEqual(vars["phase"], PHASE_STIM)
+        guard.step(20.0, None, True, now=5.1)           # 连续 2.1s → 到边
+        self.assertEqual(vars["phase"], PHASE_COOL)
 
     def test_jump_rate_triggers_edge_below_threshold(self):
-        guard = self._guard(jump_rise=5.0, jump_window_s=1.0)
+        guard, vars = self._guard(jump_rise=5.0, jump_window_s=1.0)
         guard.step(10.0, None, True, now=0.0)
         guard.step(10.0, None, True, now=0.5)
         guard.step(10.0, None, True, now=1.0)
-        # 1 秒窗口内 10 → 16（速率 6 kPa/s ≥ 5），虽未过红线 17 也判到边
-        guard.step(16.0, None, True, now=1.5)
-        self.assertEqual(guard.phase, PHASE_COOL)
+        guard.step(16.0, None, True, now=1.5)   # 速率 6 kPa/s ≥ 5，未过红线
+        self.assertEqual(vars["phase"], PHASE_COOL)
 
-    def test_jump_rate_below_threshold_no_trigger(self):
-        guard = self._guard(jump_rise=5.0, jump_window_s=1.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(10.0, None, True, now=0.5)
-        guard.step(13.0, None, True, now=1.5)     # 速率 3 kPa/s < 5
-        self.assertEqual(guard.phase, PHASE_STIM)
+    def test_recovery_emits_recovered(self):
+        guard, vars = self._guard(cooldown_s=0.0)
+        guard.step(5.0, None, True, now=0.0)
+        guard.step(45.0, None, True, now=1.0)           # 到边
+        events = guard.step(5.0, None, True, now=2.0)   # 低于蓝线 15
+        self.assertIn("recovered", events)
+        self.assertEqual(vars["phase"], PHASE_STIM)
 
-    # ---- 惩罚窗口 / 冷静期 ----
-
-    def test_punish_window_outputs_then_expires(self):
-        guard = self._guard(ramp_s=0.0, punish_strength=120, punish_s=1.5)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=1.0)             # 到边进冷静
-        self.assertEqual(guard.outputs(1.5), (0, 120))    # 窗口内惩罚输出
-        self.assertEqual(guard.outputs(2.6), (0, 0))      # 窗口(1.5s)已过
-        # 冷静期内重复评估不再重新开窗
-        guard.step(50.0, None, True, now=3.0)
-        self.assertEqual(guard.outputs(3.0), (0, 0))
-
-    def test_punish_disabled_by_strength_zero_or_duration_zero(self):
-        guard = self._guard(ramp_s=0.0, punish_strength=0)
-        guard.step(10.0, None, True, now=0.0)
+    def test_recovery_hold_requires_sustained_below(self):
+        guard, vars = self._guard(cooldown_s=0.0, recovery_hold_s=3.0)
+        guard.step(5.0, None, True, now=0.0)
         guard.step(45.0, None, True, now=1.0)
-        self.assertEqual(guard.outputs(1.0), (0, 0))
-        guard2 = self._guard(ramp_s=0.0, punish_s=0.0)
-        guard2.step(10.0, None, True, now=0.0)
-        guard2.step(45.0, None, True, now=1.0)
-        self.assertEqual(guard2.outputs(1.0), (0, 0))
+        guard.step(5.0, None, True, now=2.0)    # 低于蓝线 1s → 未达
+        self.assertEqual(vars["phase"], PHASE_COOL)
+        guard.step(5.0, None, True, now=5.1)    # 3.1s ≥ 3 → 恢复
+        self.assertEqual(vars["phase"], PHASE_STIM)
 
-    def test_cool_strength_held_during_cooldown(self):
-        guard = self._guard(ramp_s=0.0, cool_strength=20, punish_strength=0,
-                            cooldown_s=10.0, recovery_threshold=20.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(42.0, None, True, now=5.0)
-        self.assertEqual(guard.outputs(6.0), (20, 0))     # 冷静期维持强度
+    def test_release_request_consumed(self):
+        guard, vars = self._guard()
+        guard.step(5.0, None, True, now=0.0)
+        vars["release_req"] = 1.0
+        events = guard.step(5.0, None, True, now=1.0)
+        self.assertIn("release", events)
+        self.assertEqual(vars["phase"], PHASE_RELEASE)
+        self.assertEqual(vars["release_req"], 0.0)      # 消费后清零
 
-    def test_recovery_requires_cooldown_and_low_pressure(self):
-        guard = self._guard(cooldown_s=10.0, recovery_threshold=20.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(42.0, None, True, now=5.0)
-        # 未满冷静时长：即使气压已回落也不恢复
-        guard.step(5.0, None, True, now=12.0)
-        self.assertEqual(guard.phase, PHASE_COOL)
-        # 时长已满但气压仍高：继续冷静（回差防抖）
-        guard.step(30.0, None, True, now=20.0)
-        self.assertEqual(guard.phase, PHASE_COOL)
-        # 时长满 + 气压回落 → 恢复刺激
-        guard.step(5.0, None, True, now=25.0)
-        self.assertEqual(guard.phase, PHASE_STIM)
-        self.assertEqual(guard.cycles, 1)
+    def test_release_timer_returns_to_stim_and_resets_cycles(self):
+        guard, vars = self._guard(release_s=1.0)
+        guard.step(5.0, None, True, now=0.0)
+        vars["release_req"] = 1.0
+        guard.step(5.0, None, True, now=1.0)            # 进释放
+        vars["cycles"] = 3.0
+        events = guard.step(5.0, None, True, now=2.5)   # 释放满 1s
+        self.assertIn("stim", events)
+        self.assertEqual(vars["phase"], PHASE_STIM)
+        self.assertEqual(vars["cycles"], 0.0)
 
-    def test_stale_pressure_failsafe_zeroes(self):
-        guard = self._guard(ramp_s=0.0)
-        guard.step(10.0, None, True, now=0.0)
-        self.assertEqual(guard.outputs(0.0)[0], 60)
-        guard.step(None, None, False, now=99.0)   # 气压失联
-        self.assertEqual(guard.phase, PHASE_IDLE)
-        self.assertEqual(guard.outputs(99.0), (0, 0))
+    def test_failsafe_forces_idle_after_seen(self):
+        guard, vars = self._guard()
+        guard.step(5.0, None, True, now=0.0)
+        guard.step(5.0, None, True, now=1.0)
+        guard.step(None, None, False, now=99.0)         # 气压失联
+        self.assertEqual(vars["phase"], PHASE_IDLE)
 
-    def test_offline_then_online_reenters_stim(self):
-        guard = self._guard()
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(None, None, False, now=1.0)
-        self.assertEqual(guard.phase, PHASE_IDLE)
-        guard.step(10.0, None, True, now=2.0)
-        self.assertEqual(guard.phase, PHASE_STIM)
+    def test_pure_app_session_not_forced_idle(self):
+        """从未有过气压读数（纯官方会话）时不强制待机，app 事件照常。"""
+        guard, vars = self._guard()
+        events = guard.step(None, 4, False, now=0.0)
+        self.assertIn("app_4", events)
+        self.assertEqual(vars["phase"], PHASE_IDLE)     # 机器不动相位
+        guard.step(None, 4, False, now=1.0)
+        self.assertEqual(guard.step(None, 1, False, now=2.0), ["app_1"])
 
-    def test_ramp_climbs_to_target(self):
-        guard = self._guard(ramp_s=10.0, stim_strength=100)
-        guard.step(10.0, None, True, now=0.0)
-        self.assertEqual(guard.outputs(0.0)[0], 0)        # 爬升起点
-        self.assertEqual(guard.outputs(5.0)[0], 50)       # 中点
-        self.assertEqual(guard.outputs(12.0)[0], 100)     # 爬满
-
-    # ---- 阈值自适应（官方「阈值自适应调整」） ----
-
-    def test_adaptive_red_drops_after_edge_and_blue_follows(self):
-        guard = self._guard(adapt_drop_pct=10.0, adapt_blue_follow=30.0)
-        guard.step(10.0, None, True, now=0.0)
-        self.assertAlmostEqual(guard.red_threshold(), 17.0)
-        self.assertAlmostEqual(guard.blue_threshold(), 15.0)
-        guard.step(45.0, None, True, now=1.0)     # 成功边控
-        # 红线下降 17×10% = 1.7 → 15.3；蓝线跟随 1.7×30% = 0.51 → 14.49
-        self.assertAlmostEqual(guard.red_threshold(), 15.3)
-        self.assertAlmostEqual(guard.blue_threshold(), 14.49)
-
-    def test_adaptive_red_timed_drop_when_no_edge(self):
-        guard = self._guard(adapt_drop_delay_s=10.0, adapt_drop_rate=10.0)
-        guard.step(10.0, None, True, now=0.0)     # STIM
-        guard.step(10.0, None, True, now=5.0)     # 未到等待时长 → 不降
-        self.assertAlmostEqual(guard.red_threshold(), 17.0)
-        guard.step(10.0, None, True, now=15.0)    # dt=10（截 5s）
-        self.assertAlmostEqual(guard.red_threshold(), 8.5)   # 17 − 17×10%×5
-
-    def test_adaptive_blue_rises_when_cool_stuck(self):
-        guard = self._guard(adapt_blue_delay_s=10.0,
-                            adapt_blue_rise_rate=10.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=1.0)     # 冷静（phase_since=1）
-        guard.step(15.5, None, True, now=5.0)     # 未到等待 → 蓝线不动
-        self.assertAlmostEqual(guard.blue_threshold(), 15.0)
-        guard.step(15.5, None, True, now=20.0)    # dt=15（截 5s）→ +7.5
-        # 蓝线 22.5 越过红线 → 钳到红线 − 0.5 = 16.5（恢复变容易）
-        self.assertAlmostEqual(guard.blue_threshold(), 16.5)
-        self.assertEqual(guard.phase, PHASE_STIM) # 15.5 ≤ 16.5 → 已恢复
-
-    def test_adaptive_disabled_by_toggles(self):
-        guard = self._guard(adapt_stim=False, adapt_drop_pct=20.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=1.0)
-        self.assertAlmostEqual(guard.red_threshold(), 17.0)   # 开关关闭不降
-        guard2 = self._guard(adapt_cool=False, adapt_blue_delay_s=0.0,
-                             adapt_blue_rise_rate=100.0)
-        guard2.step(10.0, None, True, now=0.0)
-        guard2.step(45.0, None, True, now=1.0)
-        guard2.step(45.0, None, True, now=3.0)
-        self.assertAlmostEqual(guard2.blue_threshold(), 15.0)
-
-    # ---- 释放触发（次数 / 持续时长） ----
-
-    def test_cycle_limit_triggers_release_then_restarts(self):
-        guard = self._guard(ramp_s=0.0, cooldown_s=5.0,
-                            recovery_threshold=20.0, cycle_limit=2,
-                            stim_strength=60, assist_strength=80,
-                            release_s=15.0)
-        # 第 1 轮：到边 → 冷静 → 恢复（未达上限，回刺激）
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=1.0)
-        self.assertEqual((guard.phase, guard.cycles), (PHASE_COOL, 1))
+    def test_session_time_accumulates(self):
+        guard, vars = self._guard()
+        guard.step(5.0, None, True, now=0.0)
         guard.step(5.0, None, True, now=10.0)
-        self.assertEqual(guard.phase, PHASE_STIM)
-        # 第 2 轮：到边 → 冷静 → 达上限，进释放
-        guard.step(45.0, None, True, now=20.0)
-        self.assertEqual((guard.phase, guard.cycles), (PHASE_COOL, 2))
-        guard.step(5.0, None, True, now=30.0)
-        self.assertEqual(guard.phase, PHASE_RELEASE)
-        # 助力强度经刺激器变量输出（不爬升）
-        self.assertEqual(guard.outputs(30.0), (80, 0))
-        # 释放计时（15s）满 → 循环计数清零、回到刺激
-        guard.step(5.0, None, True, now=44.0)
-        self.assertEqual(guard.phase, PHASE_RELEASE)
-        guard.step(5.0, None, True, now=46.0)
-        self.assertEqual((guard.phase, guard.cycles), (PHASE_STIM, 0))
-
-    def test_time_release_after_session_duration(self):
-        """官方「游戏进行指定时长后，允许高潮释放」。"""
-        guard = self._guard(time_release_s=30.0, assist_strength=80)
-        guard.step(10.0, None, True, now=0.0)     # 会话开始（首次进刺激）
-        guard.step(10.0, None, True, now=29.0)
-        self.assertEqual(guard.phase, PHASE_STIM)
-        guard.step(10.0, None, True, now=31.0)    # 会话 31s ≥ 30 → 释放
-        self.assertEqual(guard.phase, PHASE_RELEASE)
-        self.assertEqual(guard.outputs(31.0), (80, 0))
-
-    def test_time_release_also_applies_at_cool_completion(self):
-        guard = self._guard(time_release_s=30.0, cooldown_s=5.0,
-                            recovery_threshold=20.0, cycle_limit=0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=10.0)    # 到边（会话 10s）
-        guard.step(5.0, None, True, now=40.0)     # 冷静期满且会话 ≥ 30s
-        self.assertEqual(guard.phase, PHASE_RELEASE)
-
-    def test_release_holds_indefinitely_when_release_s_zero(self):
-        guard = self._guard(cooldown_s=0.0, recovery_threshold=20.0,
-                            cycle_limit=1, release_s=0.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=1.0)
-        guard.step(5.0, None, True, now=100.0)
-        self.assertEqual(guard.phase, PHASE_RELEASE)
-        guard.step(5.0, None, True, now=999.0)
-        self.assertEqual(guard.phase, PHASE_RELEASE)      # 一直保持
-
-    def test_release_exits_via_failover_only(self):
-        """释放期内气压失联 → fail-safe 待机。"""
-        guard = self._guard(cooldown_s=0.0, recovery_threshold=20.0,
-                            cycle_limit=1, release_s=0.0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=1.0)
-        guard.step(5.0, None, True, now=2.0)
-        self.assertEqual(guard.phase, PHASE_RELEASE)
-        guard.step(None, None, False, now=50.0)
-        self.assertEqual(guard.phase, PHASE_IDLE)
+        self.assertAlmostEqual(vars["session_time"], 10.0)
+        self.assertAlmostEqual(vars["phase_time"], 10.0)
 
 
-class GuardAppTests(unittest.TestCase):
-    """app 模式：跟随官方边控会话（edgeState 0-4）。"""
+class EventStreamTests(unittest.TestCase):
+    """事件流规则引擎：条件 / 赋值 / 回滚。"""
 
-    def _guard(self, **overrides) -> EdgeGuard:
-        merged = dict(_FAST_JUDGE)
-        merged.update(overrides)
-        return EdgeGuard(MarginConfig({"mode": "app", **merged}))
+    def _stream(self) -> EventStream:
+        stream = EventStream(log=lambda msg: None)
+        return stream
 
-    def test_state_map(self):
-        guard = self._guard(ramp_s=0.0, stim_strength=60,
-                            assist_strength=80)
-        guard.step(10.0, 1, True, now=0.0)
-        self.assertEqual(guard.phase, PHASE_STIM)
-        self.assertEqual(guard.outputs(0.0), (60, 0))
-        guard.step(10.0, 2, True, now=1.0)
-        self.assertEqual(guard.phase, PHASE_COOL)
-        self.assertEqual(guard.cycles, 1)
-        guard.step(10.0, 3, True, now=2.0)
-        self.assertEqual(guard.phase, PHASE_COOL)
-        self.assertEqual(guard.cycles, 1)         # 判定不计新循环
-        guard.step(10.0, 4, True, now=3.0)
-        self.assertEqual(guard.phase, PHASE_RELEASE)
-        self.assertEqual(guard.outputs(3.0), (80, 0))     # 助力经刺激器输出
-        # 会话回到刺激（新一轮）→ 循环计数清零
-        guard.step(10.0, 1, True, now=4.0)
-        self.assertEqual((guard.phase, guard.cycles), (PHASE_STIM, 0))
+    def test_where_min_max_bounds(self):
+        stream = self._stream()
+        stream.load([{"on": "tick", "where": {"phase": {"min": 1, "max": 1}},
+                      "set": {"x": 1}},
+                     {"on": "tick", "where": {"phase": {"min": 2}},
+                      "set": {"y": 1}}])
+        vars = {"phase": 1.0}
+        stream.dispatch(["tick"], vars, now=0.0)
+        self.assertEqual(vars, {"phase": 1.0, "x": 1.0})
 
-    def test_missing_session_stays_idle(self):
-        guard = self._guard()
-        guard.step(10.0, None, True, now=0.0)
-        self.assertEqual(guard.phase, PHASE_IDLE)
+    def test_where_expression_bound(self):
+        stream = self._stream()
+        stream.load([{"on": "tick",
+                      "where": {"cycles": {"min": "{threshold}"}},
+                      "set": {"hit": 1}}])
+        vars = {"cycles": 5.0, "threshold": 5.0}
+        stream.dispatch(["tick"], vars, now=0.0)
+        self.assertEqual(vars["hit"], 1.0)
+        vars["cycles"] = 4.0
+        stream.dispatch(["tick"], vars, now=1.0)
+        self.assertEqual(vars["hit"], 1.0)              # 未再触发
 
-    def test_ramp_applies_in_app_mode(self):
-        guard = self._guard(ramp_s=10.0, stim_strength=100)
-        guard.step(10.0, 1, True, now=0.0)
-        self.assertEqual(guard.outputs(0.0)[0], 0)
-        self.assertEqual(guard.outputs(10.0)[0], 100)
+    def test_set_expressions_apply_sequentially(self):
+        stream = self._stream()
+        stream.load([{"on": "edge", "set": {"a": "{a} + 1"}},
+                     {"on": "edge", "set": {"b": "{a} * 10"}}])
+        vars = {"a": 0.0}
+        stream.dispatch(["edge"], vars, now=0.0)
+        self.assertEqual(vars["a"], 1.0)
+        self.assertEqual(vars["b"], 10.0)               # 读到上一条的结果
 
-    def test_release_conditions_not_applied_in_app_mode(self):
-        """app 模式释放只由会话状态 4 决定，次数/时长条件不介入。"""
-        guard = self._guard(cooldown_s=0.0, recovery_threshold=20.0,
-                            cycle_limit=1, release_s=15.0,
-                            time_release_s=30.0)
-        guard.step(10.0, 1, True, now=0.0)
-        guard.step(10.0, 2, True, now=1.0)        # cycles=1 已达上限
-        guard.step(10.0, 1, True, now=40.0)       # 会话 40s 已达时长
-        self.assertEqual(guard.phase, PHASE_STIM)  # 仍由会话状态决定
+    def test_revert_after_s(self):
+        stream = self._stream()
+        stream.load([{"on": "edge", "set": {"p": 100},
+                      "revert": {"p": 0}, "after_s": 1.0}])
+        vars = {"p": 0.0}
+        stream.dispatch(["edge"], vars, now=0.0)
+        self.assertEqual(vars["p"], 100.0)
+        stream.dispatch(["tick"], vars, now=0.5)        # 未到期
+        self.assertEqual(vars["p"], 100.0)
+        stream.dispatch(["tick"], vars, now=1.1)        # 到期回滚
+        self.assertEqual(vars["p"], 0.0)
+
+    def test_missing_var_treated_as_zero(self):
+        stream = self._stream()
+        stream.load([{"on": "tick", "where": {"nothing": {"max": 1}},
+                      "set": {"x": "{nothing} + 2"}}])
+        vars: dict = {}
+        stream.dispatch(["tick"], vars, now=0.0)
+        self.assertEqual(vars["x"], 2.0)
+
+    def test_invalid_expression_skipped(self):
+        stream = self._stream()
+        stream.load([{"on": "tick", "set": {"x": "1 / 0"}},
+                     {"on": "tick", "set": {"y": 3}}])
+        vars: dict = {}
+        stream.dispatch(["tick"], vars, now=0.0)
+        self.assertNotIn("x", vars)
+        self.assertEqual(vars["y"], 3.0)
+
+    def test_load_skips_invalid_rows(self):
+        stream = self._stream()
+        stream.load(["bad", {"set": {}}, {"on": "tick", "set": {"x": 1}}])
+        self.assertEqual(len(stream.rules), 1)
 
 
-# ---------------------------------------------------------------- 桥接器
+# ---------------------------------------------------------------- 默认事件流
 
-class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
-    def test_tick_feeds_variables_and_drives_strength(self):
-        bridge, commands = _bridge({"ramp_s": 0.0},
+class DefaultStreamTests(unittest.TestCase):
+    """默认事件流构造的行为（取代旧设置项选择）。"""
+
+    def test_stim_ramp_via_tick_rule(self):
+        bridge, commands = _bridge({"ramp_s": 3.0},
+                                   commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)                   # 进入刺激，phase_time=0
+        self.assertEqual(bridge.vars["phase"], PHASE_STIM)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 0)
+        bridge.tick_at(101.5)                   # 1.5s / 3s → 30
+        self.assertEqual(bridge.engine.signals["stim_strength"], 30)
+        bridge.tick_at(103.5)                   # 爬满 → 60
+        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
+        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
+
+    def test_cool_phase_outputs_cool_setting(self):
+        bridge, commands = _bridge({"ramp_s": 0.0, "cool_strength": 20,
+                                    "smooth": 0.0},
                                    commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
-        self.assertAlmostEqual(bridge.engine.signals["pressure"], 10.0)
-        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
-        self.assertEqual(bridge.engine.signals["punish_strength"], 0)
-        # 默认行：刺激器/惩罚器最大值驱动 A/B 强度（全部经映射表派发）
-        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
-        self.assertEqual(commands.zap_calls, [])
-        self.assertEqual(commands.fire_calls, [])
-        self.assertEqual(commands.reset_calls, [])
+        _set_pressure(commands, 45.0)
+        bridge.tick_at(110.0)                   # 到边 → 冷静
+        self.assertEqual(bridge.vars["phase"], PHASE_COOL)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 20)
 
-    def test_seven_variables_present(self):
-        bridge, _ = _bridge({}, commands=_commands(pressure=30.0))
+    def test_punish_on_edge_then_auto_revert(self):
+        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0},
+                                   commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
-        self.assertEqual(set(bridge.engine.signals), set(PARAM_DEFS))
-        self.assertEqual(set(bridge.engine.signals),
-                         {"pressure", "edge", "stim_strength",
-                          "punish_strength", "on_edge", "on_release",
-                          "cycles"})
-        self.assertEqual(bridge.engine.signals["cycles"], 0)
-        self.assertEqual(bridge.engine.signals["on_release"], 0)
+        _set_pressure(commands, 45.0)
+        bridge.tick_at(110.0)                   # 到边 → 惩罚 100
+        self.assertEqual(bridge.engine.signals["punish_strength"], 100)
+        self.assertEqual(_strength_by_channel(commands), {"A": 100, "B": 100})
+        bridge.tick_at(111.2)                   # 1s 后自动归零
+        self.assertEqual(bridge.engine.signals["punish_strength"], 0)
+        self.assertEqual(_strength_by_channel(commands), {"A": 0, "B": 0})
+
+    def test_edge_adaptation_red_drop_and_blue_follow(self):
+        bridge, _ = _bridge({"ramp_s": 0.0, "smooth": 0.0,
+                             "adapt_drop_pct": 10.0,
+                             "adapt_blue_follow": 30.0},
+                            commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)
+        self.assertAlmostEqual(bridge.vars["red"], 17.0)
+        _set_pressure(bridge_commands(bridge), 45.0)
+        bridge.tick_at(110.0)                   # 到边 → 自适应
+        self.assertAlmostEqual(bridge.vars["red"], 15.3)
+        self.assertAlmostEqual(bridge.vars["blue"], 14.49)
+
+    def test_timed_red_decay_after_delay(self):
+        bridge, commands = _bridge({"adapt_drop_delay_s": 10.0,
+                                    "adapt_drop_rate": 10.0,
+                                    "smooth": 0.0},
+                                   commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)                   # 进入刺激
+        t = _steps(bridge, 100.0, 50)           # 5s < 100s 等待 → 不降
+        self.assertAlmostEqual(bridge.vars["red"], 17.0)
+        t = _steps(bridge, t, 600)              # 再 60s（≥ 等待）→ 持续缓降
+        self.assertLess(bridge.vars["red"], 16.0)
+        self.assertGreaterEqual(bridge.vars["red"], 1.0)
+
+    def test_blue_rises_when_cool_stuck(self):
+        bridge, commands = _bridge({"adapt_blue_delay_s": 10.0,
+                                    "adapt_blue_rise_rate": 10.0,
+                                    "smooth": 0.0},
+                                   commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)
+        _set_pressure(commands, 45.0)
+        bridge.tick_at(110.0)                   # 到边 → 冷静
+        self.assertAlmostEqual(bridge.vars["blue"], 15.0)
+        t = _steps(bridge, 110.0, 600)          # 冷静 60s（≥ 等待）→ 蓝线上升
+        # 恢复变容易：蓝线抬升（红线 17 → 钳到 16.5）
+        self.assertGreater(bridge.vars["blue"], 15.0)
+        self.assertLessEqual(bridge.vars["blue"], bridge.vars["red"] - 0.5)
+
+    def test_release_after_five_cycles(self):
+        """默认事件流：边控 5 轮后请求释放（旧「循环上限」设置的行为）。"""
+        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
+                                    "cooldown_s": 0.0,
+                                    "assist_strength": 80,
+                                    "release_s": 0.0},
+                                   commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)                   # 刺激
+        t = 100.0
+        for _ in range(5):
+            _set_pressure(commands, 45.0)
+            bridge.tick_at(t := t + 0.1)        # 到边
+            _set_pressure(commands, 5.0)
+            bridge.tick_at(t := t + 0.1)        # 恢复
+        self.assertEqual(bridge.vars["cycles"], 5.0)
+        self.assertEqual(bridge.vars["phase"], PHASE_STIM)
+        _set_pressure(commands, 45.0)
+        bridge.tick_at(t := t + 0.1)            # 第 5 次恢复时已置释放请求
+        _set_pressure(commands, 5.0)
+        bridge.tick_at(t := t + 0.1)            # 消费请求 → 释放
+        self.assertEqual(bridge.vars["phase"], PHASE_RELEASE)
+        self.assertEqual(bridge.engine.signals["on_release"], 1)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 80)
+        self.assertEqual(_strength_by_channel(commands), {"A": 80, "B": 80})
+
+    def test_app_session_wiring(self):
+        """默认事件流：官方会话状态变化驱动相位（旧「边控模式」的选择）。"""
+        bridge, commands = _bridge({}, commands=_commands(edge=1))
+        bridge.tick_at(100.0)                   # app_1 → 刺激相位
+        self.assertEqual(bridge.vars["phase"], PHASE_STIM)
+        self.assertEqual(bridge.engine.signals["edge"], 1)
+        commands.state.slots["s_bmt"].edge_state = 4
+        bridge.tick_at(110.0)                   # app_4 → 释放（助力输出）
+        self.assertEqual(bridge.vars["phase"], PHASE_RELEASE)
+        self.assertEqual(bridge.engine.signals["on_release"], 1)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 80)
+        commands.state.slots["s_bmt"].edge_state = 0
+        bridge.tick_at(120.0)                   # app_0 → 待机
+        self.assertEqual(bridge.vars["phase"], PHASE_IDLE)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 0)
+
+    def test_pure_app_without_sensor(self):
+        """无气压读数（纯官方会话）时事件流照常驱动。"""
+        bridge, commands = _bridge({}, commands=FakeCommands())
+        commands.state.slots["s_bmt"].edge_state = 4
+        bridge.tick_at(100.0)
+        self.assertEqual(bridge.vars["phase"], PHASE_RELEASE)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 80)
 
     def test_on_edge_flag(self):
-        bridge, _ = _bridge({"edge_threshold": 40.0},
+        bridge, _ = _bridge({"edge_threshold": 40.0, "smooth": 0.0},
                             commands=_commands(pressure=30.0))
         bridge.tick_at(100.0)
         self.assertEqual(bridge.engine.signals["on_edge"], 0)
-        bridge2, _ = _bridge({"edge_threshold": 25.0},
+        bridge2, _ = _bridge({"edge_threshold": 25.0, "smooth": 0.0},
                              commands=_commands(pressure=30.0))
         bridge2.tick_at(100.0)
         self.assertEqual(bridge2.engine.signals["on_edge"], 1)
 
     def test_leak_compensation_offsets_pressure(self):
-        """漏气补偿叠加到读数参与判定与映射变量。"""
-        bridge, _ = _bridge({"leak_comp": 3.0, "smooth": 0.0,
-                             "edge_threshold": 17.0},
+        bridge, _ = _bridge({"leak_comp": 3.0, "smooth": 0.0},
                             commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
         self.assertAlmostEqual(bridge.engine.signals["pressure"], 13.0)
@@ -535,50 +498,38 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         bridge2.tick_at(100.0)
         self.assertEqual(bridge2.engine.signals["on_edge"], 1)  # 18 ≥ 17
 
-    def test_on_release_flag_follows_phase(self):
-        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
-                                    "cooldown_s": 0.0,
-                                    "recovery_threshold": 20.0,
-                                    "cycle_limit": 1, "release_s": 0.0,
-                                    "assist_strength": 90},
+    def test_empty_events_disables_output_construction(self):
+        """清空事件流 = 关闭全部行为构造（安全开关）。"""
+        bridge, commands = _bridge({"events": [], "ramp_s": 0.0},
                                    commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
-        self.assertEqual(bridge.engine.signals["on_release"], 0)
-        commands.state.slots["s_bmt"].pressure = 45.0
-        bridge.tick_at(110.0)                     # 到边 → 冷静
-        self.assertEqual(bridge.engine.signals["on_release"], 0)
-        commands.state.slots["s_bmt"].pressure = 5.0
-        bridge.tick_at(120.0)                     # 冷静期满 → 释放
-        self.assertEqual(bridge.engine.signals["on_release"], 1)
-        self.assertEqual(_strength_by_channel(commands), {"A": 90, "B": 90})
+        self.assertEqual(bridge.vars["phase"], PHASE_STIM)  # 机器事实照常
+        self.assertEqual(bridge.engine.signals.get("stim_strength"), 0)
+        self.assertEqual(commands.strength_calls, [])
 
-    def test_crossing_drives_punish_through_mapping(self):
-        """到边 → 冷静 + 惩罚窗口：默认行派发惩罚器强度，窗口过后归零。"""
-        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
-                                    "punish_strength": 120,
-                                    "punish_s": 1.0},
-                                   commands=_commands(pressure=10.0))
+    def test_custom_event_rule(self):
+        bridge, _ = _bridge({"events": [
+            {"on": "tick", "set": {"stim_strength": "{stim_setting}"}}],
+        }, commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
-        # 气压升到红线之上 → 冷静 + 惩罚输出经映射行派发
-        commands.state.slots["s_bmt"].pressure = 45.0
-        bridge.tick_at(110.0)
-        self.assertEqual(_strength_by_channel(commands),
-                         {"A": 120, "B": 120})
-        # 惩罚窗口（1s）过后：冷静强度 0 → 映射行派发归零
-        bridge.tick_at(112.0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 0, "B": 0})
+        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
 
-    def test_mapping_dispatch_targets_family_first_device(self):
-        """无绑定设置：映射派发按家族解析第一台输出设备。"""
-        commands = _commands(pressure=10.0)
-        commands.state.slots["s_out2"] = Slot(slot_id="s_out2", name="郊狼2",
-                                              type="COYOTE_031")
-        bridge, _ = _bridge({"ramp_s": 0.0}, commands)
+    def test_blue_invariant_clamped_by_bridge(self):
+        bridge, _ = _bridge({"events": [
+            {"on": "tick", "set": {"blue": 50}}]},
+            commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
-        self.assertTrue(all(sid == "s_out"          # 家族内排序第一台
-                            for _ch, _v, sid in commands.strength_calls))
+        self.assertAlmostEqual(bridge.vars["blue"], 16.5)   # ≤ 红线 − 0.5
 
+
+def bridge_commands(bridge: MarginBridge) -> FakeCommands:
+    """取桥接器持有的命令假件（测试辅助）。"""
+    return bridge.commands
+
+
+# ---------------------------------------------------------------- 桥接器
+
+class BridgeTests(unittest.IsolatedAsyncioTestCase):
     def test_sensor_slot_binding(self):
         commands = _commands(pressure=10.0)
         commands.state.slots["s_bmt2"] = Slot(slot_id="s_bmt2", name="灵猫2",
@@ -587,6 +538,16 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         bridge, _ = _bridge({"sensor_slot": "s_bmt2"}, commands)
         bridge.tick_at(100.0)
         self.assertAlmostEqual(bridge.engine.signals["pressure"], 20.0)
+
+    def test_mapping_dispatch_targets_family_first_device(self):
+        commands = _commands(pressure=10.0)
+        commands.state.slots["s_out2"] = Slot(slot_id="s_out2", name="郊狼2",
+                                              type="COYOTE_031")
+        bridge, _ = _bridge({"ramp_s": 0.0}, commands)
+        bridge.tick_at(100.0)
+        bridge.tick_at(103.5)                       # 爬满 60
+        self.assertTrue(all(sid == "s_out"          # 家族内排序第一台
+                            for _ch, _v, sid in commands.strength_calls))
 
     def test_smooth_averages_pressure(self):
         bridge, commands = _bridge({"smooth": 0.5},
@@ -602,34 +563,35 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         bridge, commands = _bridge({"ramp_s": 0.0})
         del commands.state.slots["s_bmt"]
         bridge.tick_at(100.0)
-        self.assertEqual(bridge.engine.signals["stim_strength"], 0)
+        self.assertEqual(bridge.vars["phase"], PHASE_IDLE)
+        self.assertEqual(bridge.engine.signals.get("stim_strength"), 0)
         self.assertEqual(commands.strength_calls, [])
 
     def test_pause_zeroes_outputs_via_mapping(self):
         bridge, commands = _bridge({"ramp_s": 0.0},
                                    commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
+        bridge.tick_at(103.5)
         self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
         self.assertTrue(bridge.toggle_pause())
         bridge.tick_at(110.0)
-        self.assertEqual(bridge.engine.signals["stim_strength"], 0)
+        self.assertEqual(bridge.vars["phase"], PHASE_IDLE)
         self.assertEqual(_strength_by_channel(commands), {"A": 0, "B": 0})
         self.assertFalse(bridge.toggle_pause())
 
     def test_no_direct_device_calls_ever(self):
-        """整个闭环过程（刺激→到边→冷静→恢复→释放）零直接设备调用。"""
+        """整个闭环（刺激→到边→冷静→恢复→…→释放）零直接设备调用。"""
         bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
-                                    "punish_strength": 100,
-                                    "cooldown_s": 0.0,
-                                    "recovery_threshold": 20.0,
-                                    "cycle_limit": 1, "release_s": 1.0},
+                                    "cooldown_s": 0.0, "release_s": 0.1},
                                    commands=_commands(pressure=10.0))
-        for t, p in ((100, 10.0), (110, 45.0), (120, 5.0), (130, 45.0),
-                     (140, 5.0), (150, 5.0), (160, 5.0)):
-            commands.state.slots["s_bmt"].pressure = p
-            bridge.tick_at(t)
+        t = 100.0
+        for _ in range(7):
+            _set_pressure(commands, 45.0)
+            bridge.tick_at(t := t + 0.1)
+            _set_pressure(commands, 5.0)
+            bridge.tick_at(t := t + 0.1)
         bridge.toggle_pause()
-        bridge.tick_at(170)
+        bridge.tick_at(t + 1.0)
         self.assertEqual(commands.zap_calls, [])
         self.assertEqual(commands.fire_calls, [])
         self.assertEqual(commands.reset_calls, [])
@@ -639,16 +601,15 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
                                    commands=_commands(pressure=10.0))
         await bridge.start()
         bridge.tick_at(100.0)
+        bridge.tick_at(103.5)
         self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
         await bridge.stop()
-        # 停止归零也走映射派发（两路输出清零 → 默认行求值 0）
         self.assertEqual(_strength_by_channel(commands), {"A": 0, "B": 0})
         self.assertEqual(commands.reset_calls, [])
         self.assertEqual(bridge.engine.signals["stim_strength"], 0)
 
     async def test_stop_without_output_change_touches_nothing(self):
-        """从未派发过强度（off 模式）时停止不碰设备。"""
-        bridge, commands = _bridge({"mode": "off"})
+        bridge, commands = _bridge({"events": []})
         await bridge.start()
         await asyncio.sleep(0)
         await bridge.stop()
@@ -666,6 +627,19 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
                          "{punish_strength}")
         self.assertNotIn("in_strength_b", bridge.engine.mappings)
+
+    async def test_reload_config_refreshes_mirrors_keeps_adaptation(self):
+        bridge, _ = _bridge({"ramp_s": 0.0, "adapt_drop_pct": 10.0,
+                             "smooth": 0.0},
+                            commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)
+        _set_pressure(bridge.commands, 45.0)
+        bridge.tick_at(110.0)                       # 红线自适应 17 → 15.3
+        self.assertAlmostEqual(bridge.vars["red"], 15.3)
+        bridge.config["stim_strength"] = 100
+        await bridge.reload_config()
+        self.assertEqual(bridge.vars["stim_setting"], 100.0)  # 镜像热更新
+        self.assertAlmostEqual(bridge.vars["red"], 15.3)      # 自适应保留
 
 
 # ---------------------------------------------------------------- 插件契约
@@ -689,44 +663,59 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.4.0")
-        # 七个映射变量与 bridge PARAM_DEFS 一致
+        self.assertEqual(meta["version"], "0.5.0")
+        # 变量表与 bridge PARAM_DEFS 一致（事实 + 输出 + 设置镜像）
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
-        self.assertEqual(set(meta["params"]),
-                         {"pressure", "edge", "stim_strength",
-                          "punish_strength", "on_edge", "on_release",
-                          "cycles"})
-        # 配置声明：基础 / 判定条件 / 释放 / 强度 / 阈值自适应 / 映射表
+        # 配置声明：基础 / 判定条件 / 强度 / 自适应取值 / 事件流 / 映射表
         cfg = meta["config"]
-        for key in ("mode", "sensor_slot", "smooth", "sensor_timeout_s",
+        for key in ("sensor_slot", "smooth", "sensor_timeout_s", "leak_comp",
                     "edge_threshold", "recovery_threshold", "edge_hold_s",
                     "jump_rise", "jump_window_s", "cooldown_s",
-                    "recovery_hold_s",
-                    "cycle_limit", "time_release_s", "release_s",
+                    "recovery_hold_s", "release_s",
                     "stim_strength", "cool_strength", "assist_strength",
-                    "ramp_s", "punish_strength", "punish_s",
-                    "adapt_stim", "adapt_drop_pct", "adapt_drop_delay_s",
-                    "adapt_drop_rate", "adapt_blue_follow", "adapt_cool",
-                    "adapt_blue_delay_s", "adapt_blue_rise_rate",
-                    "leak_comp",
-                    "mappings"):
+                    "ramp_s",
+                    "adapt_drop_pct", "adapt_drop_rate", "adapt_drop_delay_s",
+                    "adapt_blue_follow", "adapt_blue_rise_rate",
+                    "adapt_blue_delay_s",
+                    "events", "mappings"):
             self.assertIn(key, cfg)
-        self.assertNotIn("phase", cfg)            # 已移除
-        self.assertNotIn("pressure_pct", cfg)
-        self.assertNotIn("output_slot", cfg)
-        self.assertNotIn("deny_zap_s", cfg)       # 直呼动作已移除
-        self.assertNotIn("release_fire_s", cfg)
-        self.assertNotIn("outputs", cfg)          # 纯输入设计：无回传通道
+        # 选择类设置项已移除（行为由默认事件流构造）
+        for removed in ("mode", "punish_strength", "punish_s", "cycle_limit",
+                        "time_release_s", "adapt_stim", "adapt_cool"):
+            self.assertNotIn(removed, cfg)
+        self.assertNotIn("outputs", cfg)
         self.assertEqual(cfg["mappings"].get("rows"), "in")
-        self.assertEqual(cfg["mode"].get("choices"),
-                         ["sensor", "app", "off"])
-        # 设置项分组对齐官方设置页
-        self.assertEqual(cfg["edge_threshold"].get("group"), "judge")
-        self.assertEqual(cfg["cycle_limit"].get("group"), "release")
-        self.assertEqual(cfg["adapt_drop_pct"].get("group"), "adapt")
+        # 默认事件流：非空且每行含 on/set
+        events = cfg["events"]["default"]
+        self.assertTrue(events)
+        for row in events:
+            self.assertIn("on", row)
+            self.assertIn("set", row)
         # 按键动作静态声明与 button_actions 一致
         self.assertEqual(meta["actions"],
                          ["margin_reset_pressure", "margin_guard_toggle"])
+
+    def test_default_events_construct_previous_choices(self):
+        """默认事件流覆盖旧设置项的全部行为选择。"""
+        events = META["config"]["events"]["default"]
+        ons = [row["on"] for row in events]
+        # 官方会话接线（旧 mode 选择）
+        for state in range(5):
+            self.assertIn(f"app_{state}", ons)
+        # 到边惩罚（旧 punish_strength/punish_s 设置）
+        punish = next(row for row in events
+                      if row["on"] == "edge" and "punish_strength" in row["set"])
+        self.assertEqual(punish["set"]["punish_strength"], 100)
+        self.assertEqual(punish["after_s"], 1.0)
+        # 边控 5 轮释放（旧 cycle_limit 设置）
+        release = next(row for row in events
+                       if row["on"] == "recovered")
+        self.assertEqual(release["where"], {"cycles": {"min": 5}})
+        self.assertEqual(release["set"], {"release_req": 1})
+        # 相位 → 刺激器输出（刺激/冷静/释放/待机）
+        stim_rules = [row for row in events if row["on"] == "tick"
+                      and "stim_strength" in row.get("set", {})]
+        self.assertEqual(len(stim_rules), 4)
 
     def test_config_defaults_cover_all_declared_keys(self):
         module = MarginControlModule()
@@ -735,13 +724,12 @@ class PluginContractTests(unittest.TestCase):
         for key, item in MARGIN_CONFIG_DEFAULTS.items():
             self.assertIn(key, spec)
 
-    def test_link_params_returns_seven_variables(self):
+    def test_link_params_returns_variable_table(self):
         module = MarginControlModule()
         params = module.link_params()
         self.assertEqual([name for name, _label in params],
-                         ["pressure", "edge", "stim_strength",
-                          "punish_strength", "on_edge", "on_release",
-                          "cycles"])
+                         list(PARAM_DEFS))
+        self.assertEqual(len(params), 24)
 
     def test_button_actions_registered(self):
         from plugins import ButtonAction
@@ -754,7 +742,6 @@ class PluginContractTests(unittest.TestCase):
         self.assertTrue(all(callable(a.on_press) for a in actions))
 
     def test_default_mappings_target_core_inputs(self):
-        """默认行引用的变量都存在，目标都是核心输入参数（映射表唯一通道）。"""
         from dglab.params import input_specs
 
         specs = input_specs()
@@ -762,20 +749,6 @@ class PluginContractTests(unittest.TestCase):
             self.assertIn(row["param"], specs)
             self.assertEqual(row["expr"],
                              "max({stim_strength}, {punish_strength})")
-
-    def test_default_expr_evaluates_per_phase(self):
-        """默认表达式在状态机各阶段求值符合预期（刺激器/惩罚器取最大）。"""
-        from dglab.expr import evaluate
-
-        row = DEFAULT_MAPPINGS[0]["expr"]
-        self.assertEqual(evaluate(row, {"stim_strength": 60.0,
-                                        "punish_strength": 0.0}), 60.0)
-        self.assertEqual(evaluate(row, {"stim_strength": 0.0,
-                                        "punish_strength": 120.0}), 120.0)
-        self.assertEqual(evaluate(row, {"stim_strength": 60.0,
-                                        "punish_strength": 120.0}), 120.0)
-        self.assertEqual(evaluate(row, {"stim_strength": 0.0,
-                                        "punish_strength": 0.0}), 0.0)
 
     def test_module_class_attributes(self):
         module = MarginControlModule()
@@ -791,7 +764,6 @@ class PluginContractTests(unittest.TestCase):
             "submit": staticmethod(lambda coro: None),
             "engine": None,
         })())
-        # 未启动桥接器时按键不抛错
         module._press_guard_toggle(None, None)
         module.on_unload()
 
