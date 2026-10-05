@@ -348,7 +348,75 @@ class EventStreamTests(unittest.TestCase):
     def test_load_skips_invalid_rows(self):
         stream = self._stream()
         stream.load(["bad", {"set": {}}, {"on": "tick", "set": {"x": 1}}])
-        self.assertEqual(len(stream.rules), 1)
+        self.assertEqual(len(stream.event_rules.get("tick", [])), 1)
+
+    # ---- 新 schema：trigger = period | event + actions ----
+
+    def test_event_trigger_with_action_revert(self):
+        stream = self._stream()
+        stream.load([{"name": "到边惩罚", "trigger": "event", "arg": "edge",
+                      "actions": [{"var": "p", "value": 100,
+                                   "revert": 0, "after_s": 1.0}]}])
+        vars = {"p": 0.0}
+        stream.dispatch(["edge"], vars, now=0.0)
+        self.assertEqual(vars["p"], 100.0)
+        stream.dispatch(["tick"], vars, now=0.5)        # 未到期
+        self.assertEqual(vars["p"], 100.0)
+        stream.dispatch(["tick"], vars, now=1.1)        # 到期回滚
+        self.assertEqual(vars["p"], 0.0)
+
+    def test_event_trigger_expr_action(self):
+        stream = self._stream()
+        stream.load([{"name": "红线下降", "trigger": "event", "arg": "edge",
+                      "actions": [{"var": "red",
+                                   "expr": "max(1, {red} - 1)"}]}])
+        vars = {"red": 17.0}
+        stream.dispatch(["edge"], vars, now=0.0)
+        self.assertEqual(vars["red"], 16.0)
+
+    def test_period_trigger_cadence_and_where(self):
+        stream = self._stream()
+        stream.load([{"name": "刺激期", "trigger": "period", "arg": 100,
+                      "where": {"phase": {"min": 1, "max": 1}},
+                      "actions": [{"var": "s", "expr": "{s} + 1"}]}])
+        vars = {"phase": 1.0, "s": 0.0}
+        stream.dispatch(["tick"], vars, now=0.0)        # 首拍 dt=0 不累计
+        self.assertEqual(vars["s"], 0.0)
+        stream.dispatch(["tick"], vars, now=0.1)        # 满 100ms → 触发
+        self.assertEqual(vars["s"], 1.0)
+        stream.dispatch(["tick"], vars, now=0.15)       # 未满周期
+        self.assertEqual(vars["s"], 1.0)
+        stream.dispatch(["tick"], vars, now=0.25)       # 累计满 → 触发
+        self.assertEqual(vars["s"], 2.0)
+        # 相位条件不满足时不触发
+        vars["phase"] = 2.0
+        stream.dispatch(["tick"], vars, now=0.4)
+        stream.dispatch(["tick"], vars, now=0.55)
+        self.assertEqual(vars["s"], 2.0)
+
+    def test_invalid_typed_rows_skipped(self):
+        stream = self._stream()
+        stream.load([{"name": "空动作", "trigger": "period", "arg": 100,
+                      "actions": []},
+                     {"name": "未知触发器", "trigger": "bogus", "arg": "edge",
+                      "actions": [{"var": "a", "value": 1}]},
+                     {"name": "缺动作字段", "trigger": "event", "arg": "edge",
+                      "actions": [{"var": "a"}]},
+                     {"name": "正常", "trigger": "event", "arg": "edge",
+                      "actions": [{"var": "a", "value": 1}]}])
+        self.assertEqual(len(stream.period_rules), 0)
+        self.assertEqual(len(stream.event_rules.get("edge", [])), 1)
+
+    def test_legacy_on_set_rows_still_supported(self):
+        """v0.5 行 schema 兼容：on/set/revert/after_s。"""
+        stream = self._stream()
+        stream.load([{"on": "edge", "set": {"p": 100},
+                      "revert": {"p": 0}, "after_s": 1.0}])
+        vars = {"p": 0.0}
+        stream.dispatch(["edge"], vars, now=0.0)
+        self.assertEqual(vars["p"], 100.0)
+        stream.dispatch(["tick"], vars, now=1.1)
+        self.assertEqual(vars["p"], 0.0)
 
 
 # ---------------------------------------------------------------- 默认事件流
@@ -473,8 +541,9 @@ class DefaultStreamTests(unittest.TestCase):
         """无气压读数（纯官方会话）时事件流照常驱动。"""
         bridge, commands = _bridge({}, commands=FakeCommands())
         commands.state.slots["s_bmt"].edge_state = 4
-        bridge.tick_at(100.0)
+        bridge.tick_at(100.0)                   # app_4 → 相位 3
         self.assertEqual(bridge.vars["phase"], PHASE_RELEASE)
+        bridge.tick_at(100.1)                   # 释放期周期规则生效
         self.assertEqual(bridge.engine.signals["stim_strength"], 80)
 
     def test_on_edge_flag(self):
@@ -509,16 +578,44 @@ class DefaultStreamTests(unittest.TestCase):
 
     def test_custom_event_rule(self):
         bridge, _ = _bridge({"events": [
+            {"name": "常量输出", "trigger": "period", "arg": 100,
+             "actions": [{"var": "stim_strength",
+                          "expr": "{stim_setting}"}]}],
+        }, commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)                   # 首拍 dt=0，周期未满
+        bridge.tick_at(100.1)                   # 周期触发
+        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
+
+    def test_custom_legacy_rule_still_works(self):
+        bridge, _ = _bridge({"events": [
             {"on": "tick", "set": {"stim_strength": "{stim_setting}"}}],
         }, commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
         self.assertEqual(bridge.engine.signals["stim_strength"], 60)
 
+    def test_temps_seeded_and_usable(self):
+        """temps 播种临时变量：规则可引用，重载不覆盖已有值。"""
+        bridge, _ = _bridge({"temps": [{"name": "my_count", "value": 5}],
+                             "events": [
+            {"name": "用临时变量", "trigger": "period", "arg": 100,
+             "actions": [{"var": "stim_strength",
+                          "expr": "{my_count} * 10"}]}],
+        }, commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)
+        self.assertEqual(bridge.vars["my_count"], 5.0)
+        bridge.tick_at(100.1)                   # 周期触发
+        self.assertEqual(bridge.engine.signals["stim_strength"], 50)
+        bridge.vars["my_count"] = 9.0
+        bridge._seed_temps()                    # 重载播种不覆盖已有值
+        self.assertEqual(bridge.vars["my_count"], 9.0)
+
     def test_blue_invariant_clamped_by_bridge(self):
         bridge, _ = _bridge({"events": [
-            {"on": "tick", "set": {"blue": 50}}]},
+            {"name": "蓝线越界", "trigger": "period", "arg": 100,
+             "actions": [{"var": "blue", "value": 50}]}]},
             commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
+        bridge.tick_at(100.1)
         self.assertAlmostEqual(bridge.vars["blue"], 16.5)   # ≤ 红线 − 0.5
 
 
@@ -663,10 +760,10 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.5.0")
+        self.assertEqual(meta["version"], "0.6.0")
         # 变量表与 bridge PARAM_DEFS 一致（事实 + 输出 + 设置镜像）
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
-        # 配置声明：基础 / 判定条件 / 强度 / 自适应取值 / 事件流 / 映射表
+        # 配置声明：基础 / 判定条件 / 强度 / 自适应取值 / 事件流 / 临时变量
         cfg = meta["config"]
         for key in ("sensor_slot", "smooth", "sensor_timeout_s", "leak_comp",
                     "edge_threshold", "recovery_threshold", "edge_hold_s",
@@ -677,7 +774,7 @@ class PluginContractTests(unittest.TestCase):
                     "adapt_drop_pct", "adapt_drop_rate", "adapt_drop_delay_s",
                     "adapt_blue_follow", "adapt_blue_rise_rate",
                     "adapt_blue_delay_s",
-                    "events", "mappings"):
+                    "events", "temps", "mappings"):
             self.assertIn(key, cfg)
         # 选择类设置项已移除（行为由默认事件流构造）
         for removed in ("mode", "punish_strength", "punish_s", "cycle_limit",
@@ -685,12 +782,15 @@ class PluginContractTests(unittest.TestCase):
             self.assertNotIn(removed, cfg)
         self.assertNotIn("outputs", cfg)
         self.assertEqual(cfg["mappings"].get("rows"), "in")
-        # 默认事件流：非空且每行含 on/set
+        # 默认事件流：非空，每行含 name/trigger/arg/actions
         events = cfg["events"]["default"]
         self.assertTrue(events)
         for row in events:
-            self.assertIn("on", row)
-            self.assertIn("set", row)
+            self.assertIn("name", row)
+            self.assertIn("trigger", row)
+            self.assertIn("arg", row)
+            self.assertIn("actions", row)
+            self.assertTrue(row["actions"])
         # 按键动作静态声明与 button_actions 一致
         self.assertEqual(meta["actions"],
                          ["margin_reset_pressure", "margin_guard_toggle"])
@@ -698,24 +798,33 @@ class PluginContractTests(unittest.TestCase):
     def test_default_events_construct_previous_choices(self):
         """默认事件流覆盖旧设置项的全部行为选择。"""
         events = META["config"]["events"]["default"]
-        ons = [row["on"] for row in events]
         # 官方会话接线（旧 mode 选择）
-        for state in range(5):
-            self.assertIn(f"app_{state}", ons)
+        wired = {str(row["arg"]) for row in events
+                 if row["trigger"] == "event"
+                 and str(row["arg"]).startswith("app_")}
+        self.assertEqual(wired, {"app_0", "app_1", "app_2", "app_3", "app_4"})
         # 到边惩罚（旧 punish_strength/punish_s 设置）
         punish = next(row for row in events
-                      if row["on"] == "edge" and "punish_strength" in row["set"])
-        self.assertEqual(punish["set"]["punish_strength"], 100)
-        self.assertEqual(punish["after_s"], 1.0)
+                      if row["arg"] == "edge"
+                      and any(a["var"] == "punish_strength"
+                              for a in row["actions"]))
+        action = punish["actions"][0]
+        self.assertEqual(action["value"], 100)
+        self.assertEqual(action["revert"], 0)
+        self.assertEqual(action["after_s"], 1.0)
         # 边控 5 轮释放（旧 cycle_limit 设置）
-        release = next(row for row in events
-                       if row["on"] == "recovered")
+        release = next(row for row in events if row["arg"] == "recovered")
         self.assertEqual(release["where"], {"cycles": {"min": 5}})
-        self.assertEqual(release["set"], {"release_req": 1})
-        # 相位 → 刺激器输出（刺激/冷静/释放/待机）
-        stim_rules = [row for row in events if row["on"] == "tick"
-                      and "stim_strength" in row.get("set", {})]
-        self.assertEqual(len(stim_rules), 4)
+        self.assertEqual(release["actions"],
+                         [{"var": "release_req", "value": 1}])
+        # 相位周期规则（刺激/冷静/释放/待机 → 刺激器输出）
+        period_names = {row["name"] for row in events
+                        if row["trigger"] == "period"}
+        self.assertTrue({"刺激期", "冷静期", "释放期", "待机期"}
+                        <= period_names)
+        # 自适应缓降/回升规则在对应相位上
+        self.assertIn("刺激期红线缓降", period_names)
+        self.assertIn("冷静期蓝线回升", period_names)
 
     def test_config_defaults_cover_all_declared_keys(self):
         module = MarginControlModule()

@@ -38,40 +38,50 @@ zap / fire / reset 直呼），全部输出由输入映射表行引用 `{stim_st
 配置项「事件流」是规则列表，按声明顺序执行；**删改规则即改变行为**，
 取代旧版的模式 / 惩罚 / 释放条件 / 自适应开关等设置项。
 
-规则 schema：
+规则 schema（`trigger: period` 周期触发 / `event` 事件触发）：
 
 ```json
-{"on": "edge",                      // 触发事件
- "where": {"cycles": {"min": 5}},   // 可选：变量条件（min/max 含边界，值可为表达式）
- "set": {"release_req": 1},         // 变量赋值（数字或表达式，按序生效）
- "revert": {"punish_strength": 0},  // 可选：after_s 秒后回滚
- "after_s": 1.0}
+{"name": "刺激期",                 // 规则名（日志/可读性）
+ "trigger": "period",             // period=周期触发 | event=事件触发
+ "arg": 100,                      // period: 周期(毫秒)；event: 事件名
+ "where": {"phase": {"min": 1}},  // 可选：变量条件（min/max 含边界，值可为表达式）
+ "actions": [                     // 动作列表（变量赋值，按序生效）
+   {"var": "stim_strength", "expr": "…"},              // 表达式赋值
+   {"var": "punish_strength", "value": 100,            // 直接赋值
+    "revert": 0, "after_s": 1.0}                       // 可选：定时回滚
+ ]}
 ```
 
-触发事件：`tick`（每拍 0.1s）、`edge`（判到边）、`recovered`（恢复刺激）、
-`release`（进入释放期）、`stim`（进入/回到刺激期）、`app_0`…`app_4`
-（官方边控会话状态变化）。表达式经核心安全求值（四则运算 +
-`abs/min/max/round`，不支持比较运算符），未定义变量按 0 处理。
+触发事件（event 的 arg）：`tick`（每拍 0.1s）、`edge`（判到边）、
+`recovered`（恢复刺激）、`release`（进入释放期）、`stim`（进入/回到
+刺激期）、`app_0`…`app_4`（官方边控会话状态变化）。表达式经核心安全求值
+（四则运算 + `abs/min/max/round`，不支持比较运算符），未定义变量按 0 处理。
+
+配置项「临时变量」（`temps`：行 `{name, value}`）装载时播种进变量表，
+供规则做自定义计数器/中间量（重载不覆盖已有值）。v0.5 行 schema
+（`{"on", "where", "set", "revert", "after_s"}`）继续兼容。
 
 默认事件流（宿主装载时写入配置文件，可随时改回）：
 
 | 规则 | 构造的行为（旧设置项） |
 |---|---|
 | `app_1/app_2+app_3/app_4/app_0 → 相位` | 官方会话接线（旧「边控模式」选择；与气压判定共用状态流，二者皆可驱动） |
-| `edge → punish_strength=100，1s 后回滚 0` | 到边惩罚（旧「惩罚器强度/时长」） |
-| `edge → red 按设置 % 下降；blue 按比例跟随` | 边控后红线自适应（旧「自适应开关」+ 数值） |
-| `tick（刺激期超时）→ red 缓降` | 久不到边红线缓降 |
-| `tick（冷静期超时）→ blue 缓升` | 久未恢复蓝线回升（恢复变容易） |
-| `tick（按相位）→ stim_strength` | 刺激期爬升 / 冷静期维持 / 释放期助力 / 待机归零 |
-| `recovered（cycles ≥ 5）→ release_req=1` | 边控 5 轮后允许释放（旧「循环上限」；删除该行即不限次数） |
+| `event edge → punish_strength=100，3s 后回滚 0` | 到边惩罚（旧「惩罚器强度/时长」） |
+| `event edge → red 按设置 % 下降；blue 按比例跟随` | 边控后红线自适应（旧「自适应开关」+ 数值） |
+| `period 刺激期红线缓降（超时）→ red 缓降` | 久不到边红线缓降 |
+| `period 冷静期蓝线回升（超时）→ blue 缓升` | 久未恢复蓝线回升（恢复变容易） |
+| `period 刺激期/冷静期/释放期/待机期 → stim_strength` | 刺激期爬升 / 冷静期维持 / 释放期助力 / 待机归零 |
+| `event recovered（cycles ≥ 5）→ release_req=1` | 边控 5 轮后允许释放（旧「循环上限」；删除该行即不限次数） |
 
 常用自定义行示例：
 
 ```json
-{"on": "tick", "where": {"session_time": {"min": 1800}, "phase": {"max": 2}},
- "set": {"release_req": 1}}                    // 会话 30 分钟后允许释放
-{"on": "release", "set": {"punish_strength": "{assist_setting}"},
- "revert": {"punish_strength": 0}, "after_s": 5.0}   // 释放瞬间来一段强输出
+{"name": "持续时长释放", "trigger": "period", "arg": 100,
+ "where": {"session_time": {"min": 1800}, "phase": {"max": 2}},
+ "actions": [{"var": "release_req", "value": 1}]}    // 会话 30 分钟后允许释放
+{"name": "释放强化", "trigger": "event", "arg": "release",
+ "actions": [{"var": "punish_strength", "expr": "{assist_setting}",
+              "revert": 0, "after_s": 5.0}]}         // 释放瞬间来一段强输出
 ```
 
 清空事件流 = 关闭全部行为构造（安全开关；状态机事实照常产出，但无变量
@@ -157,6 +167,7 @@ in_strength_b = max({stim_strength}, {punish_strength})
 | 未恢复蓝线上升等待 (秒) | 100 | 冷静阶段回升触发等待 |
 | **事件流 / 映射表** | | |
 | 事件流 | 默认规则 | 行为选择在此构造（见上文 schema 与示例） |
+| 临时变量 | 空 | 行 `{name, value}` 播种进变量表（自定义计数器/中间量） |
 | 输入映射表 | 空 | 行 `{param, expr}`；留空用默认行（设备控制唯一通道） |
 
 全部配置与事件流支持**热生效**（联动页「保存设置」即重载；镜像变量随

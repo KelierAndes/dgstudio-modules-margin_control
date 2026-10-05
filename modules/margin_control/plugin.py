@@ -11,8 +11,10 @@
   到边惩罚（定时回滚）、阈值自适应（边控后红线下降/超时缓降、蓝线跟随/
   回升）、相位 → 刺激器输出、边控 5 轮后请求释放；
 * 删改规则即改变行为（如删除「边控 5 轮后释放」行即不限次数，加一行
-  ``{"on": "tick", "where": {"session_time": {"min": 1800}, "phase":
-  {"max": 2}}, "set": {"release_req": 1}}`` 即持续时长释放）；
+  周期规则 ``{"name": "持续时长释放", "trigger": "period", "arg": 100,
+  "where": {"session_time": {"min": 1800}, "phase": {"max": 2}},
+  "actions": [{"var": "release_req", "value": 1}]}`` 即持续时长释放）；
+* 配置项 ``temps`` 播种临时变量（自定义计数器/中间量），规则可引用；
 * 设置项只保留取值类参数（判定阈值/时长、强度、自适应数值），事件流
   规则经同名镜像变量引用，随设置热更新。
 
@@ -26,7 +28,7 @@
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "description": "灵猫气压 / 官方边控会话 → 事件流驱动闭环边控：状态机"
                    "产出事实，默认事件流构造惩罚/自适应/释放等行为选择，"
                    "设备控制只经映射表传递。",
@@ -229,63 +231,94 @@ META = {
             "label": "事件流", "type": "list",
             "default": [
                 # 官方边控会话（Socket V4 edgeState 0-4）驱动相位
-                {"on": "app_1", "set": {"phase": 1}},
-                {"on": "app_2", "set": {"phase": 2}},
-                {"on": "app_3", "set": {"phase": 2}},
-                {"on": "app_4", "set": {"phase": 3}},
-                {"on": "app_0", "set": {"phase": 0}},
-                # 到边 → 惩罚器输出（1 秒后自动归零）
-                {"on": "edge", "set": {"punish_strength": 100},
-                 "revert": {"punish_strength": 0}, "after_s": 1.0},
+                {"name": "会话接线：刺激", "trigger": "event", "arg": "app_1",
+                 "actions": [{"var": "phase", "value": 1}]},
+                {"name": "会话接线：冷静", "trigger": "event", "arg": "app_2",
+                 "actions": [{"var": "phase", "value": 2}]},
+                {"name": "会话接线：冷静判定", "trigger": "event", "arg": "app_3",
+                 "actions": [{"var": "phase", "value": 2}]},
+                {"name": "会话接线：允许高潮", "trigger": "event", "arg": "app_4",
+                 "actions": [{"var": "phase", "value": 3}]},
+                {"name": "会话接线：停止", "trigger": "event", "arg": "app_0",
+                 "actions": [{"var": "phase", "value": 0}]},
+                # 到边 → 惩罚器输出（窗口后自动归零）
+                {"name": "到边惩罚", "trigger": "event", "arg": "edge",
+                 "actions": [{"var": "punish_strength", "value": 100,
+                              "revert": 0, "after_s": 1.0}]},
                 # 到边 → 红线按设置百分比下降，蓝线按比例跟随
-                {"on": "edge",
-                 "set": {"red": "max(1, {red} - {red} * {adapt_drop_pct} / 100)"}},
-                {"on": "edge",
-                 "set": {"blue": "max(0, {blue} - ({edge_threshold} - {red})"
-                                 " * {adapt_blue_follow} / 100)"}},
+                {"name": "边控后红线下降", "trigger": "event", "arg": "edge",
+                 "actions": [{"var": "red",
+                              "expr": "max(1, {red} - {red}"
+                                      " * {adapt_drop_pct} / 100)"}]},
+                {"name": "蓝线跟随下降", "trigger": "event", "arg": "edge",
+                 "actions": [{"var": "blue",
+                              "expr": "max(0, {blue} - ({edge_threshold}"
+                                      " - {red}) * {adapt_blue_follow}"
+                                      " / 100)"}]},
+                # 刺激期（每 100ms）：刺激器按爬升时长趋向刺激强度
+                {"name": "刺激期", "trigger": "period", "arg": 100,
+                 "where": {"phase": {"min": 1, "max": 1}},
+                 "actions": [{"var": "stim_strength",
+                              "expr": "min({stim_setting},"
+                                      " round({stim_setting}"
+                                      " * {phase_time}"
+                                      " / max(0.1, {ramp_s})))"}]},
                 # 刺激期超时未到边 → 红线缓降（官方「N 秒内未判定高潮」）
-                {"on": "tick",
+                {"name": "刺激期红线缓降", "trigger": "period", "arg": 100,
                  "where": {"phase": {"min": 1, "max": 1},
                            "phase_time": {"min": "{adapt_drop_delay_s}"}},
-                 "set": {"red": "max(1, {red} - {red} * {adapt_drop_rate}"
-                                " / 100 * 0.1)"}},
+                 "actions": [{"var": "red",
+                              "expr": "max(1, {red} - {red}"
+                                      " * {adapt_drop_rate} / 100 * 0.1)"}]},
+                # 冷静期（每 100ms）：维持冷静期强度
+                {"name": "冷静期", "trigger": "period", "arg": 100,
+                 "where": {"phase": {"min": 2, "max": 2}},
+                 "actions": [{"var": "stim_strength",
+                              "expr": "{cool_setting}"}]},
                 # 冷静期超时未恢复 → 蓝线缓升（官方「N 秒内未判定恢复刺激」）
-                {"on": "tick",
+                {"name": "冷静期蓝线回升", "trigger": "period", "arg": 100,
                  "where": {"phase": {"min": 2, "max": 2},
                            "phase_time": {"min": "{adapt_blue_delay_s}"}},
-                 "set": {"blue": "min({red} - 0.5, {blue} + {blue}"
-                                 " * {adapt_blue_rise_rate} / 100 * 0.1)"}},
-                # 相位 → 刺激器输出（刺激期爬升 / 冷静期维持 / 释放期助力）
-                {"on": "tick",
-                 "where": {"phase": {"min": 1, "max": 1}},
-                 "set": {"stim_strength": "min({stim_setting},"
-                                          " round({stim_setting}"
-                                          " * {phase_time}"
-                                          " / max(0.1, {ramp_s})))"}},
-                {"on": "tick",
-                 "where": {"phase": {"min": 2, "max": 2}},
-                 "set": {"stim_strength": "{cool_setting}"}},
-                {"on": "tick",
+                 "actions": [{"var": "blue",
+                              "expr": "min({red} - 0.5, {blue} + {blue}"
+                                      " * {adapt_blue_rise_rate}"
+                                      " / 100 * 0.1)"}]},
+                # 释放期（每 100ms）：输出助力强度
+                {"name": "释放期", "trigger": "period", "arg": 100,
                  "where": {"phase": {"min": 3}},
-                 "set": {"stim_strength": "{assist_setting}"}},
-                {"on": "tick",
+                 "actions": [{"var": "stim_strength",
+                              "expr": "{assist_setting}"}]},
+                # 待机期（每 100ms）：输出归零
+                {"name": "待机期", "trigger": "period", "arg": 100,
                  "where": {"phase": {"max": 0}},
-                 "set": {"stim_strength": 0}},
+                 "actions": [{"var": "stim_strength", "value": 0}]},
                 # 边控 5 轮后请求释放（官方「固定模式」；删掉本行即不限次数，
-                # 持续时长释放示例：{"on": "tick", "where": {"session_time":
-                # {"min": 1800}, "phase": {"max": 2}}, "set": {"release_req": 1}})
-                {"on": "recovered",
+                # 持续时长释放示例：{"name": "持续时长释放", "trigger":
+                # "period", "arg": 100, "where": {"session_time": {"min":
+                # 1800}, "phase": {"max": 2}}, "actions": [{"var":
+                # "release_req", "value": 1}]})
+                {"name": "边控 5 轮后允许释放", "trigger": "event",
+                 "arg": "recovered",
                  "where": {"cycles": {"min": 5}},
-                 "set": {"release_req": 1}},
+                 "actions": [{"var": "release_req", "value": 1}]},
             ],
             "group": "map",
-            "desc": "事件流规则（按序执行）：行 {on: 触发事件, where: 变量"
-                    "条件{min/max}, set: 变量赋值, revert+after_s: 定时回滚}。"
-                    "触发事件：tick / edge / recovered / release / stim / "
-                    "app_0…app_4；赋值与条件值为数字或表达式字符串（四则"
-                    "运算 + abs/min/max/round，引用 {} 变量）。行为选择"
-                    "（官方会话接线、惩罚、自适应、释放条件）都在此构造，"
-                    "删改行即改变行为",
+            "desc": "事件流规则（按序执行）：行 {name: 规则名, trigger: "
+                    "period|event, arg: 周期毫秒|事件名, where: 变量条件"
+                    "{min/max}, actions: [{var, value|expr, revert?, "
+                    "after_s?}]}。触发事件：tick / edge / recovered / "
+                    "release / stim / app_0…app_4；表达式为四则运算 + "
+                    "abs/min/max/round，引用 {} 变量。行为选择（官方会话"
+                    "接线、惩罚、自适应、释放条件）都在此构造，删改行即"
+                    "改变行为",
+        },
+        # ---- 临时变量（事件流可用的自定义中间量） ----
+        "temps": {
+            "label": "临时变量", "type": "list", "default": [],
+            "group": "map",
+            "desc": "行 {name: 变量名, value: 初值}，装载时播种进变量表"
+                    "（重载不覆盖已有值），事件流与映射表表达式可引用"
+                    "（自定义计数器、中间量等）",
         },
         # ---- 两张映射表之输入表（纯输入模块，无输出表） ----
         "mappings": {

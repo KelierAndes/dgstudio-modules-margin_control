@@ -184,6 +184,7 @@ class MarginConfig(dict):
         "adapt_blue_delay_s": 100.0,
         # 事件流与映射表
         "events": [],
+        "temps": [],
         "mappings": [],
     }
 
@@ -197,53 +198,146 @@ class MarginConfig(dict):
 # ---------------------------------------------------------------- 事件流
 
 class EventStream:
-    """事件流规则引擎：事件 → 条件 → 变量赋值（含定时回滚）。
+    """事件流规则引擎：触发器 → 条件 → 动作（变量赋值，含定时回滚）。
 
-    规则按声明顺序执行，同一事件的多条规则依次生效（后面的 set 表达式
-    能读到前面规则刚写入的值）。表达式经核心 :mod:`dglab.expr` 安全求值，
-    求值失败跳过该条赋值并限流记日志。
+    规则按声明顺序执行，同一拍内后面的动作能读到前面刚写入的值。
+    表达式经核心 :mod:`dglab.expr` 安全求值（四则运算 + abs/min/max/round，
+    不支持比较运算），求值失败跳过该条赋值并限流记日志。
+
+    规则 schema::
+
+        {"name": "刺激期",                # 可选：规则名（日志/可读性）
+         "trigger": "period",            # period=周期触发 | event=事件触发
+         "arg": 100,                     # period: 周期(毫秒)；event: 事件名
+         "where": {"phase": {"min": 1}}, # 可选：变量条件（min/max 含边界，
+                                         #   值为数字或表达式字符串）
+         "actions": [                    # 动作列表（变量赋值）
+           {"var": "stim_strength", "expr": "…"},             # 表达式赋值
+           {"var": "punish_strength", "value": 100,           # 直接赋值
+            "revert": 0, "after_s": 1.0}                     # 可选：定时回滚
+         ]}
+
+    触发事件（event 的 arg）：``tick``（每拍）、``edge``（判到边）、
+    ``recovered``（恢复刺激）、``release``（进入释放期）、``stim``（进入/
+    回到刺激期）、``app_0``…``app_4``（官方边控会话状态变化）。
+
+    兼容 v0.5 行 schema：``{"on": 事件名, "where": …, "set": {变量: 值},
+    "revert": {…}, "after_s": …}``（等价于 event 触发 + 集中赋值动作）。
     """
 
     def __init__(self, log: Callable[[str], None] | None = None):
         self.log = log or (lambda msg: None)
-        self.rules: list[dict] = []
+        self.event_rules: dict[str, list[dict]] = {}
+        self.period_rules: list[dict] = []
         self._reverts: list[tuple[float, dict]] = []   # (到期时刻, 赋值表)
+        self._acc: list[float] = []                    # 周期规则累计器
+        self._last_tick: float | None = None
         self._last_error_log = float("-inf")
 
     def load(self, rows: Any) -> None:
         """装载规则列表（非法行跳过并记日志）。"""
-        self.rules = []
+        self.event_rules = {}
+        self.period_rules = []
         self._reverts.clear()
+        self._acc = []
+        self._last_tick = None
         for i, row in enumerate(rows or []):
             if not isinstance(row, dict):
                 self.log(f"事件流第 {i + 1} 行不是对象，已跳过")
                 continue
-            on = str(row.get("on") or "")
-            set_ops = row.get("set")
-            if not on or not isinstance(set_ops, dict) or not set_ops:
-                self.log(f"事件流第 {i + 1} 行缺少 on/set，已跳过")
+            name = str(row.get("name") or f"规则{i + 1}")
+            where = row.get("where") or {}
+            if "trigger" in row or "arg" in row:
+                self._load_typed(name, where, row, i)
+            else:
+                self._load_legacy(name, where, row, i)
+
+    def _load_typed(self, name: str, where: dict, row: dict, i: int) -> None:
+        """新 schema：trigger = period | event + actions 动作列表。"""
+        trigger = str(row.get("trigger") or "")
+        arg = row.get("arg")
+        actions = self._parse_actions(row.get("actions"), i, name)
+        if trigger == "period":
+            period_ms = self._num(arg, 100.0)
+            if period_ms is None or not actions:
+                self.log(f"事件流「{name}」缺少 arg(毫秒)/actions，已跳过")
+                return
+            self.period_rules.append({
+                "name": name, "period": max(0.0, period_ms) / 1000.0,
+                "where": where, "actions": actions})
+            self._acc.append(0.0)
+        elif trigger == "event":
+            on = str(arg or "")
+            if not on or not actions:
+                self.log(f"事件流「{name}」缺少 arg(事件名)/actions，已跳过")
+                return
+            self.event_rules.setdefault(on, []).append(
+                {"name": name, "where": where, "actions": actions})
+        else:
+            self.log(f"事件流「{name}」触发器 {trigger!r} 未知，已跳过")
+
+    def _load_legacy(self, name: str, where: dict, row: dict, i: int) -> None:
+        """兼容 v0.5 行 schema：on / set / revert / after_s。"""
+        on = str(row.get("on") or "")
+        set_ops = row.get("set")
+        if not on or not isinstance(set_ops, dict) or not set_ops:
+            self.log(f"事件流第 {i + 1} 行（{name}）缺少 trigger/arg/actions"
+                     "或 on/set，已跳过")
+            return
+        actions = [{"var": var, "value": raw} for var, raw in set_ops.items()]
+        self.event_rules.setdefault(on, []).append({
+            "name": name, "where": where, "actions": actions,
+            "revert": row.get("revert") or {},
+            "after_s": self._num(row.get("after_s"), 0.0)})
+
+    def _parse_actions(self, rows: Any, i: int, name: str) -> list[dict]:
+        """动作列表解析：{var, value|expr, revert?, after_s?}。"""
+        out: list[dict] = []
+        for action in rows or []:
+            if not isinstance(action, dict):
+                self.log(f"事件流「{name}」有动作不是对象，已跳过")
                 continue
-            self.rules.append({
-                "on": on,
-                "where": row.get("where") or {},
-                "set": set_ops,
-                "revert": row.get("revert") or {},
-                "after_s": self._num(row.get("after_s"), 0.0),
-            })
+            var = str(action.get("var") or "")
+            if not var:
+                self.log(f"事件流「{name}」有动作缺少 var，已跳过")
+                continue
+            entry: dict = {"var": var}
+            if "expr" in action:
+                entry["value"] = str(action["expr"])
+            elif "value" in action:
+                entry["value"] = action["value"]
+            else:
+                self.log(f"事件流「{name}」动作 {var!r} 缺少 value/expr，"
+                         "已跳过")
+                continue
+            entry["revert"] = action.get("revert")
+            entry["after_s"] = self._num(action.get("after_s"), 0.0)
+            out.append(entry)
+        return out
 
     def reset(self) -> None:
-        """清空待回滚队列（停止/重载时）。"""
+        """清空待回滚队列与周期累计（停止/重载时）。"""
         self._reverts.clear()
+        self._acc = [0.0] * len(self.period_rules)
+        self._last_tick = None
 
     def dispatch(self, events: list[str], vars: dict, now: float) -> None:
-        """按事件派发规则（events 为本拍发生的事件名，tick 由桥接器追加）。"""
+        """派发：事件规则按本拍事件触发；周期规则按 arg 毫秒节奏触发。"""
+        dt = 0.0
+        if self._last_tick is not None:
+            dt = min(1.0, max(0.0, now - self._last_tick))
+        self._last_tick = now
         for event in events:
-            for rule in self.rules:
-                if rule["on"] != event:
-                    continue
-                if not self._match(rule["where"], vars):
-                    continue
-                self._apply(rule, vars, now)
+            for rule in self.event_rules.get(event, ()):
+                if self._match(rule["where"], vars):
+                    self._apply(rule, vars, now)
+        for i, rule in enumerate(self.period_rules):
+            acc = self._acc[i] + dt
+            if rule["period"] <= 0 or acc >= rule["period"] - 1e-9:
+                acc = 0.0
+                if self._match(rule["where"], vars):
+                    self._apply(rule, vars, now)
+            self._acc[i] = acc
         self._fire_due(vars, now)
 
     # ---- 内部 -----------------------------------------------------------
@@ -285,11 +379,16 @@ class EventStream:
         return True
 
     def _apply(self, rule: dict, vars: dict, now: float) -> None:
-        for var, raw in rule["set"].items():
-            value = self._value(raw, vars)
+        for action in rule["actions"]:
+            value = self._value(action["value"], vars)
             if value is not None:
-                vars[var] = value
-        if rule["revert"] and rule["after_s"] > 0:
+                vars[action["var"]] = value
+            revert = action.get("revert")
+            after = float(action.get("after_s") or 0.0)
+            if revert is not None and after > 0:
+                self._reverts.append((now + after, {action["var"]: revert}))
+        # 兼容 v0.5 行级 revert（set 赋值后的集中回滚）
+        if rule.get("revert") and (rule.get("after_s") or 0.0) > 0:
             self._reverts.append((now + rule["after_s"],
                                   dict(rule["revert"])))
 
@@ -565,10 +664,25 @@ class MarginBridge:
         if first:
             self.engine.armed = False
         self.engine.set_mappings(self._effective_rows())
+        self._seed_temps()
         self.stream.load(self.config.get("events") or [])
         if first:
             self.engine.armed = True
             self._primed = True
+
+    def _seed_temps(self) -> None:
+        """播种配置的临时变量（temps：行 {name, value}）；重载不覆盖已有值。"""
+        for temp in self.config.get("temps") or []:
+            if not isinstance(temp, dict):
+                continue
+            name = str(temp.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                value = float(temp.get("value") or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            self.vars.setdefault(name, value)
 
     def _effective_rows(self) -> list[dict]:
         rows = [row for row in (self.config.get("mappings") or [])
@@ -673,7 +787,9 @@ class MarginBridge:
         self._running = True
         self._loop = asyncio.get_running_loop()
         self._task = asyncio.create_task(self._tick_loop())
-        self.log(f"灵猫边控联动已启动（事件流 {len(self.stream.rules)} 条规则，"
+        rule_count = len(self.stream.period_rules) + sum(
+            len(rules) for rules in self.stream.event_rules.values())
+        self.log(f"灵猫边控联动已启动（事件流 {rule_count} 条规则，"
                  f"红线 {self.vars.get('red')} kPa / "
                  f"蓝线 {self.vars.get('blue')} kPa）")
 
