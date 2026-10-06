@@ -198,9 +198,16 @@ class EdgeGuard:
 
     # ---- 自适应阈值 -----------------------------------------------------
 
+    def red_floor(self) -> float:
+        """红线下限：恢复阈值 + 安全间隙——自适应无论怎么累计，红线永不
+        跌入蓝线回差带（到边判定永不低于恢复阈值 + 0.5 kPa）。"""
+        return max(1.0, self._f("recovery_threshold", 15.0) + THRESHOLD_GAP)
+
     def red_threshold(self) -> float:
-        """当前红线（边缘阈值）：配置值 − 自适应累计下降量。"""
-        return max(1.0, self._f("edge_threshold", 17.0) - self.red_drop)
+        """当前红线（边缘阈值）：配置值 − 自适应累计下降量，不低于
+        :meth:`red_floor`。"""
+        return max(self.red_floor(),
+                   self._f("edge_threshold", 17.0) - self.red_drop)
 
     def blue_threshold(self) -> float:
         """当前蓝线（恢复阈值）：配置值 + 自适应偏移，恒低于红线至少
@@ -209,7 +216,12 @@ class EdgeGuard:
         return min(max(0.0, blue), self.red_threshold() - THRESHOLD_GAP)
 
     def _drop_red(self, amount: float) -> None:
-        """红线下降 amount kPa，蓝线按「跟随下降百分比」同步下探。"""
+        """红线下降 amount kPa（超过下限的部分不累计，避免回差带坍缩），
+        蓝线按「跟随下降百分比」同步下探。"""
+        if amount <= 0:
+            return
+        room = max(0.0, self.red_threshold() - self.red_floor())
+        amount = min(amount, room)
         if amount <= 0:
             return
         self.red_drop += amount
@@ -226,15 +238,17 @@ class EdgeGuard:
             self._drop_red(self.red_threshold() * pct / 100.0)
 
     def _adapt_step(self, now: float, dt: float) -> None:
-        """逐拍自适应：刺激阶段超时未到边红线缓慢下降；冷静阶段超时未
-        恢复蓝线缓慢上升（恢复变容易）。"""
+        """逐拍自适应：刺激阶段超时未到边红线缓慢下降（**线性**：按配置
+        基线计算降幅，不随当前红线复利衰减）；冷静阶段超时未恢复蓝线
+        缓慢上升（恢复变容易）。"""
         if dt <= 0:
             return
         if self.phase == PHASE_STIM and self._b("adapt_stim", True):
             delay = self._f("adapt_drop_delay_s")
             rate = self._f("adapt_drop_rate")
             if rate > 0 and (now - self.phase_since) >= delay:
-                self._drop_red(self.red_threshold() * rate / 100.0 * dt)
+                self._drop_red(self._f("edge_threshold", 17.0)
+                               * rate / 100.0 * dt)
         elif self.phase == PHASE_COOL and self._b("adapt_cool", True):
             delay = self._f("adapt_blue_delay_s")
             rate = self._f("adapt_blue_rise_rate")
@@ -518,19 +532,32 @@ class MarginBridge:
             return self._b.commands
 
         def resolve_slot(self, family: str = "") -> str | None:
-            """映射派发的目标设备：指定家族的第一台，回退跳过 BMTR。"""
+            """映射派发的目标设备（杜绝跨设备串扰）：
+
+            1. 显式绑定（``output_slot`` 设置）优先——存在且在线即用
+               （绑定即用户明确指定落点，不再按家族改判）；
+            2. 否则严格按家族取排序第一台；
+            3. 家族设备不在线时**不跨家族回退**（返回 None 跳过派发，
+               记限流日志）——防止郊狼闪断/离线时强度落到负鼠等其它
+               设备；BMTR 永不作为输出目标。
+            """
             state = self._b._safe_state()
             if state is None:
                 return None
             slots = {sid: state.slots[sid] for sid in sorted(state.slots)}
+            explicit = self._b._explicit_output_slot(state)
+            if explicit is not None:
+                return explicit
             if family:
                 for sid, slot in slots.items():
                     if family_of(slot.type) == family:
                         return sid
-            for sid, slot in slots.items():
-                if family_of(slot.type) != "BMTR":
-                    return sid
-            return next(iter(slots), None)
+            elif slots:
+                for sid, slot in slots.items():
+                    if family_of(slot.type) != "BMTR":
+                        return sid
+            self._b._log_unrouted(family)
+            return None
 
         def wave_order(self, family: str = "") -> list[str]:
             from dglab.waves import wave_order
@@ -574,6 +601,24 @@ class MarginBridge:
             if family_of(state.slots[sid].type) == "BMTR":
                 return state.slots[sid]
         return None
+
+    def _explicit_output_slot(self, state) -> str | None:
+        """配置绑定的目标输出设备（存在且在线、非传感器才生效）。"""
+        want = str(self.config.get("output_slot") or "").strip()
+        if want and want in (state.slots or {}) \
+                and state.slots[want].is_output_device:
+            return want
+        return None
+
+    def _log_unrouted(self, family: str) -> None:
+        """家族设备全部离线时的限流提示（30s 至多一条）。"""
+        now = self._clock()
+        if now - getattr(self, "_last_unrouted_log", float("-inf")) < 30.0:
+            return
+        self._last_unrouted_log = now
+        self.log(f"映射派发目标缺失：{family or '输出'}设备不在线，"
+                 f"本轮强度不派发（可在「目标输出设备」绑定，或在映射表"
+                 f"改用 in_ovc_* 行驱动负鼠）")
 
     # ---- 生命周期 -------------------------------------------------------
 

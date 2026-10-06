@@ -334,9 +334,10 @@ class GuardSensorTests(unittest.TestCase):
         self.assertAlmostEqual(guard.red_threshold(), 17.0)
         self.assertAlmostEqual(guard.blue_threshold(), 15.0)
         guard.step(45.0, None, True, now=1.0)     # 成功边控
-        # 红线下降 17×10% = 1.7 → 15.3；蓝线跟随 1.7×30% = 0.51 → 14.49
-        self.assertAlmostEqual(guard.red_threshold(), 15.3)
-        self.assertAlmostEqual(guard.blue_threshold(), 14.49)
+        # 红线下降 17×10% = 1.7，但下限 15 + 0.5 = 15.5：只降 1.5；
+        # 蓝线跟随 1.5×30% = 0.45 → 14.55
+        self.assertAlmostEqual(guard.red_threshold(), 15.5)
+        self.assertAlmostEqual(guard.blue_threshold(), 14.55)
 
     def test_adaptive_red_timed_drop_when_no_edge(self):
         guard = self._guard(adapt_drop_delay_s=10.0, adapt_drop_rate=10.0)
@@ -344,7 +345,8 @@ class GuardSensorTests(unittest.TestCase):
         guard.step(10.0, None, True, now=5.0)     # 未到等待时长 → 不降
         self.assertAlmostEqual(guard.red_threshold(), 17.0)
         guard.step(10.0, None, True, now=15.0)    # dt=10（截 5s）
-        self.assertAlmostEqual(guard.red_threshold(), 8.5)   # 17 − 17×10%×5
+        # 线性缓降 17×10%/s×5 = 8.5，但下限 15.5 钳住
+        self.assertAlmostEqual(guard.red_threshold(), 15.5)
 
     def test_adaptive_blue_rises_when_cool_stuck(self):
         guard = self._guard(adapt_blue_delay_s=10.0,
@@ -500,6 +502,72 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(commands.zap_calls, [])
         self.assertEqual(commands.fire_calls, [])
         self.assertEqual(commands.reset_calls, [])
+
+    # ---- 问题 1 回归：红线自适应有界（不再无声跌破设定阈值） ----
+
+    def test_red_timed_decay_is_linear_and_floored(self):
+        """缓降按配置基线线性计算，且红线永不跌破恢复阈值 + 间隙。"""
+        bridge, commands = _bridge({"adapt_drop_delay_s": 10.0,
+                                    "adapt_drop_rate": 10.0,
+                                    "smooth": 0.0},
+                                   commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)                   # 进入刺激
+        # 连续推进 600s（远超等待时长）：旧实现会指数衰减到 1.0 附近
+        t = 100.0
+        for _ in range(6000):
+            t += 0.1
+            bridge.tick_at(t)
+        red = bridge.guard.red_threshold()
+        # 线性：17 × 10%/s × dt，但下限 15 + 0.5 = 15.5
+        self.assertAlmostEqual(red, 15.5)
+        # 下限钳制：到边判定永不低于恢复阈值 + 0.5
+        self.assertGreaterEqual(red, bridge.guard.blue_threshold() + 0.5)
+
+    def test_red_edge_drop_respects_floor(self):
+        bridge, commands = _bridge({"adapt_drop_pct": 90.0,
+                                    "adapt_blue_follow": 0.0, "smooth": 0.0},
+                                   commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)                   # 刺激（since=100）
+        commands.state.slots["s_bmt"].pressure = 45.0
+        bridge.tick_at(110.0)                   # 到边：17×90% 想降 15.3
+        # 下限 15.5：只允许降到 15.5
+        self.assertAlmostEqual(bridge.guard.red_threshold(), 15.5)
+        self.assertGreaterEqual(bridge.guard.red_threshold(),
+                                bridge.guard.blue_threshold() + 0.5)
+
+    # ---- 问题 2 回归：派发目标不跨设备串扰 ----
+
+    def test_family_offline_no_cross_device_fallback(self):
+        """郊狼离线时默认行（COYOTE 家族）不派发、不落到负鼠。"""
+        commands = _commands(pressure=10.0)
+        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
+                                             type="OVC_1")
+        del commands.state.slots["s_out"]       # 郊狼离线
+        bridge, commands = _bridge({"ramp_s": 0.0}, commands)
+        bridge.tick_at(100.0)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
+        self.assertEqual(commands.strength_calls, [])   # 负鼠零派发
+
+    def test_output_slot_binding_drives_bound_device(self):
+        """绑定目标输出设备后，全部强度行都驱动绑定设备。"""
+        commands = _commands(pressure=10.0)
+        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
+                                             type="OVC_1")
+        bridge, commands = _bridge({"ramp_s": 0.0, "output_slot": "s_ovc"},
+                                   commands)
+        bridge.tick_at(100.0)
+        self.assertTrue(commands.strength_calls)
+        self.assertTrue(all(sid == "s_ovc"
+                            for _ch, _v, sid in commands.strength_calls))
+
+    def test_output_slot_ignores_sensor_binding(self):
+        """绑定到传感器（BMTR）不生效，回落家族解析。"""
+        bridge, commands = _bridge({"ramp_s": 0.0,
+                                    "output_slot": "s_bmt"},
+                                   commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)
+        self.assertTrue(all(sid == "s_out"
+                            for _ch, _v, sid in commands.strength_calls))
 
     def test_seven_variables_present(self):
         bridge, _ = _bridge({}, commands=_commands(pressure=30.0))
@@ -689,7 +757,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.7.0")
+        self.assertEqual(meta["version"], "0.8.0")
         # 七个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
@@ -698,7 +766,8 @@ class PluginContractTests(unittest.TestCase):
                           "cycles"})
         # 配置声明：基础 / 判定条件 / 释放 / 强度 / 阈值自适应 / 映射表
         cfg = meta["config"]
-        for key in ("mode", "sensor_slot", "smooth", "sensor_timeout_s",
+        for key in ("mode", "sensor_slot", "output_slot", "smooth",
+                    "sensor_timeout_s",
                     "edge_threshold", "recovery_threshold", "edge_hold_s",
                     "jump_rise", "jump_window_s", "cooldown_s",
                     "recovery_hold_s",
@@ -713,7 +782,6 @@ class PluginContractTests(unittest.TestCase):
             self.assertIn(key, cfg)
         self.assertNotIn("phase", cfg)            # 已移除
         self.assertNotIn("pressure_pct", cfg)
-        self.assertNotIn("output_slot", cfg)
         self.assertNotIn("deny_zap_s", cfg)       # 直呼动作已移除
         self.assertNotIn("release_fire_s", cfg)
         self.assertNotIn("outputs", cfg)          # 纯输入设计：无回传通道

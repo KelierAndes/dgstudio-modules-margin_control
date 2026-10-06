@@ -24,10 +24,11 @@ config/margin_control.json 时自动补齐缺省，联动页据此渲染映射�
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.7.0",
+    "version": "0.8.0",
     "description": "灵猫气压 / 官方边控会话 → 闭环边控（模块自动维护）："
-                   "红线/蓝线 + 持续判定 + 气压跳变 + 阈值自适应，边控次数"
-                   "或时长达限释放；设备控制只经映射表传递。",
+                   "红线/蓝线 + 持续判定 + 气压跳变 + 有界阈值自适应，"
+                   "边控次数或时长达限释放；派发按家族严格定位防跨设备"
+                   "串扰，设备控制只经映射表传递。",
     "settings_key": "margin_control",
     "default_enabled": False,
     "actions": ["margin_reset_pressure", "margin_guard_toggle"],
@@ -61,6 +62,13 @@ META = {
             "label": "灵猫设备 (slot_id)", "type": "str", "default": "",
             "group": "basic",
             "desc": "留空用第一台灵猫（多台时在「控制」页查看 slot_id）",
+        },
+        "output_slot": {
+            "label": "目标输出设备 (slot_id)", "type": "str", "default": "",
+            "group": "basic",
+            "desc": "映射表强度派发的落点：绑定后全部强度行都驱动该设备"
+                    "（不再按家族改判）；留空按映射行家族严格解析——家族"
+                    "设备离线时不跨设备回退（防止负鼠/郊狼互相串扰）",
         },
         "smooth": {
             "label": "气压平滑", "type": "float",
