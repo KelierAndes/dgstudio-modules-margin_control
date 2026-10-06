@@ -33,7 +33,10 @@ from modules.margin_control.plugin import (MARGIN_CONFIG_DEFAULTS, META,
 
 # 状态机/桥接测试的公共兜底：关闭持续判定与跳变（除非显式覆盖），
 # 使既有时间线不受新判定条件默认值影响
-_FAST_JUDGE = {"edge_hold_s": 0.0, "recovery_hold_s": 0.0, "jump_rise": 0.0}
+# 状态机/桥接测试的公共兜底：关闭持续判定与跳变、放大失联判停
+# （常值假压力不触发失联；失联 fail-safe 有专门用例）
+_FAST_JUDGE = {"edge_hold_s": 0.0, "recovery_hold_s": 0.0, "jump_rise": 0.0,
+               "sensor_timeout_s": 3600.0}
 
 
 class FakeCommands:
@@ -535,96 +538,65 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(bridge.guard.red_threshold(),
                                 bridge.guard.blue_threshold() + 0.5)
 
-    # ---- 问题 2 回归：派发目标不跨设备串扰 ----
+    # ---- 纯数值推送：输出表摄取（核心 → 模块）/ 固定默认行（模块 → 核心） ----
 
-    def test_defaults_follow_available_output_device(self):
-        """默认行跟随实际输出设备：郊狼离线时负鼠接管（in_ovc_* 行），
-        且旧郊狼行被归零，不留残留强度。"""
+    def test_outputs_table_ingests_pressure(self):
+        """压力经输出映射表读入（BMTR.Pressure → pressure）并驱动闭环。"""
         commands = _commands(pressure=10.0)
-        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
-                                             type="OVC_1")
-        bridge, commands = _bridge({"ramp_s": 0.0}, commands)
-        bridge.tick_at(100.0)                   # 郊狼在线 → 郊狼 A/B
-        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
-        self.assertTrue(all(sid == "s_out"
-                            for _ch, _v, sid in commands.strength_calls))
-        del commands.state.slots["s_out"]       # 郊狼离线
-        n_before = len(commands.strength_calls)
-        _run = bridge.reload_config()
-        _drain = asyncio.new_event_loop()
-        try:
-            _drain.run_until_complete(_run)
-        finally:
-            _drain.close()
+        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0}, commands)
+        bridge.tick_at(100.0)
+        self.assertAlmostEqual(bridge.engine.signals["pressure"], 10.0)
+        self.assertEqual(bridge.engine.mappings.get("pressure"), None)
+        # 输出表默认行就位
+        self.assertIn("pressure", bridge.engine.out_values)
+        self.assertIn("edge", bridge.engine.out_values)
+        # 输出表读数变化 → 到边判定走同一管道
+        commands.state.slots["s_bmt"].pressure = 45.0
         bridge.tick_at(110.0)
-        # 负鼠接管：收到刺激强度；切换后旧郊狼通道只收到归零派发
-        after = commands.strength_calls[n_before:]
-        by_device: dict[str, list[tuple[str, int]]] = {}
-        for ch, v, sid in after:
-            by_device.setdefault(sid, []).append((ch, v))
-        self.assertIn("s_ovc", by_device)
-        self.assertEqual(sorted(by_device["s_ovc"]),
-                         [("A", 60), ("B", 60)])
-        if "s_out" in by_device:
-            self.assertTrue(all(v == 0 for _ch, v in by_device["s_out"]),
-                            by_device["s_out"])
+        self.assertEqual(bridge.guard.phase, PHASE_COOL)
 
-    def test_output_slot_by_name_binding(self):
-        """绑定支持设备名包含匹配（不区分大小写）。"""
+    def test_outputs_row_redirects_second_bmtr(self):
+        """改输出表行参数（BMTR.2.Pressure）即换绑第二台灵猫。"""
         commands = _commands(pressure=10.0)
-        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc",
-                                             name="负鼠 OVC 振动",
-                                             type="OVC_1")
-        bridge, commands = _bridge({"ramp_s": 0.0, "output_slot": "负鼠"},
-                                   commands)
+        commands.state.slots["s_bmt2"] = Slot(slot_id="s_bmt2", name="灵猫2",
+                                              type="BMTR_1")
+        commands.state.slots["s_bmt2"].pressure = 33.0
+        bridge, commands = _bridge(
+            {"ramp_s": 0.0, "smooth": 0.0,
+             "outputs": [{"param": "BMTR.2.Pressure", "name": "pressure",
+                          "expr": "{BMTR.2.Pressure}", "type": "Float"}]},
+            commands)
         bridge.tick_at(100.0)
-        self.assertTrue(commands.strength_calls)
-        self.assertTrue(all(sid == "s_ovc"
-                            for _ch, _v, sid in commands.strength_calls))
+        self.assertAlmostEqual(bridge.engine.signals["pressure"], 33.0)
 
-    def test_default_rows_use_ovc_params_for_ovc_only(self):
-        """只有负鼠在线（无绑定）时，默认行自动改用 in_ovc_* 参数。"""
+    def test_frozen_pressure_failsafe(self):
+        """读数在失联判停时长内无变化 → fail-safe 待机；恢复变化即回刺激。"""
         commands = _commands(pressure=10.0)
-        del commands.state.slots["s_out"]       # 仅负鼠
-        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
-                                             type="OVC_1")
+        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
+                                    "sensor_timeout_s": 1.0}, commands)
+        bridge.tick_at(100.0)
+        self.assertEqual(bridge.guard.phase, PHASE_STIM)
+        for i in range(30):                     # 3s 读数完全不变
+            bridge.tick_at(101.0 + i * 0.1)
+        self.assertEqual(bridge.guard.phase, PHASE_IDLE)
+        commands.state.slots["s_bmt"].pressure = 10.5   # 读数恢复变化
+        bridge.tick_at(105.0)
+        self.assertEqual(bridge.guard.phase, PHASE_STIM)
+
+    def test_fixed_default_rows_push_core_params(self):
+        """默认行固定为 in_strength_a/b（模块只推数，设备由核心路由）。"""
+        commands = _commands(pressure=10.0)
         bridge, commands = _bridge({"ramp_s": 0.0}, commands)
         bridge.tick_at(100.0)
-        self.assertEqual(bridge.engine.mappings.get("in_ovc_strength_a"),
+        self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
                          "max({stim_strength}, {punish_strength})")
-        self.assertNotIn("in_strength_a", bridge.engine.mappings)
-        self.assertTrue(all(sid == "s_ovc"
-                            for _ch, _v, sid in commands.strength_calls))
-
-    def test_target_change_logged(self):
-        """派发目标变化时记日志（落点可见）。"""
-        bridge, commands = _bridge({"ramp_s": 0.0},
-                                   commands=_commands(pressure=10.0))
-        logs: list[str] = []
-        bridge.log = logs.append
-        bridge.tick_at(100.0)
-        self.assertTrue(any("派发目标" in msg for msg in logs))
-
-    def test_output_slot_binding_drives_bound_device(self):
-        """绑定目标输出设备后，全部强度行都驱动绑定设备。"""
-        commands = _commands(pressure=10.0)
-        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
-                                             type="OVC_1")
-        bridge, commands = _bridge({"ramp_s": 0.0, "output_slot": "s_ovc"},
-                                   commands)
-        bridge.tick_at(100.0)
-        self.assertTrue(commands.strength_calls)
-        self.assertTrue(all(sid == "s_ovc"
-                            for _ch, _v, sid in commands.strength_calls))
-
-    def test_output_slot_ignores_sensor_binding(self):
-        """绑定到传感器（BMTR）不生效，回落家族解析。"""
-        bridge, commands = _bridge({"ramp_s": 0.0,
-                                    "output_slot": "s_bmt"},
-                                   commands=_commands(pressure=10.0))
-        bridge.tick_at(100.0)
-        self.assertTrue(all(sid == "s_out"
-                            for _ch, _v, sid in commands.strength_calls))
+        self.assertEqual(bridge.engine.mappings.get("in_strength_b"),
+                         "max({stim_strength}, {punish_strength})")
+        # 派发携带核心参数 id（in_strength_a），设备按核心输入路由解析
+        # （各类型首台，跳过灵猫）
+        dispatched = {(ch, sid) for ch, _v, sid in commands.strength_calls}
+        self.assertIn(("A", "s_out"), dispatched)
+        self.assertIn(("B", "s_out"), dispatched)
 
     def test_seven_variables_present(self):
         bridge, _ = _bridge({}, commands=_commands(pressure=30.0))
@@ -694,25 +666,6 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         bridge.tick_at(112.0)
         self.assertEqual(_strength_by_channel(commands), {"A": 0, "B": 0})
 
-    def test_mapping_dispatch_targets_family_first_device(self):
-        """无绑定设置：映射派发按家族解析第一台输出设备。"""
-        commands = _commands(pressure=10.0)
-        commands.state.slots["s_out2"] = Slot(slot_id="s_out2", name="郊狼2",
-                                              type="COYOTE_031")
-        bridge, _ = _bridge({"ramp_s": 0.0}, commands)
-        bridge.tick_at(100.0)
-        self.assertTrue(all(sid == "s_out"          # 家族内排序第一台
-                            for _ch, _v, sid in commands.strength_calls))
-
-    def test_sensor_slot_binding(self):
-        commands = _commands(pressure=10.0)
-        commands.state.slots["s_bmt2"] = Slot(slot_id="s_bmt2", name="灵猫2",
-                                              type="BMTR_020")
-        commands.state.slots["s_bmt2"].pressure = 20.0
-        bridge, _ = _bridge({"sensor_slot": "s_bmt2"}, commands)
-        bridge.tick_at(100.0)
-        self.assertAlmostEqual(bridge.engine.signals["pressure"], 20.0)
-
     def test_smooth_averages_pressure(self):
         bridge, commands = _bridge({"smooth": 0.5},
                                    commands=_commands(pressure=0.0))
@@ -724,6 +677,8 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(bridge.engine.signals["pressure"], 22.5)
 
     def test_no_sensor_stays_idle(self):
+        """无灵猫（输出表 {BMTR.Pressure} 取 0 且恒定）→ 永不失联转新鲜，
+        闭环待机、零派发。"""
         bridge, commands = _bridge({"ramp_s": 0.0})
         del commands.state.slots["s_bmt"]
         bridge.tick_at(100.0)
@@ -814,7 +769,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.8.1")
+        self.assertEqual(meta["version"], "0.9.0")
         # 七个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
@@ -823,8 +778,7 @@ class PluginContractTests(unittest.TestCase):
                           "cycles"})
         # 配置声明：基础 / 判定条件 / 释放 / 强度 / 阈值自适应 / 映射表
         cfg = meta["config"]
-        for key in ("mode", "sensor_slot", "output_slot", "smooth",
-                    "sensor_timeout_s",
+        for key in ("mode", "smooth", "sensor_timeout_s",
                     "edge_threshold", "recovery_threshold", "edge_hold_s",
                     "jump_rise", "jump_window_s", "cooldown_s",
                     "recovery_hold_s",
@@ -841,7 +795,6 @@ class PluginContractTests(unittest.TestCase):
         self.assertNotIn("pressure_pct", cfg)
         self.assertNotIn("deny_zap_s", cfg)       # 直呼动作已移除
         self.assertNotIn("release_fire_s", cfg)
-        self.assertNotIn("outputs", cfg)          # 纯输入设计：无回传通道
         self.assertEqual(cfg["mappings"].get("rows"), "in")
         self.assertEqual(cfg["mode"].get("choices"),
                          ["sensor", "app", "off"])
@@ -915,6 +868,7 @@ class PluginContractTests(unittest.TestCase):
             "log": staticmethod(lambda msg: None),
             "submit": staticmethod(lambda coro: None),
             "engine": None,
+            "settings": {"outputs": []},
         })())
         # 未启动桥接器时按键不抛错
         module._press_guard_toggle(None, None)

@@ -1,20 +1,23 @@
-"""灵猫边控联动模块：把气压传感器与官方边控会话接入输出设备闭环。
+"""灵猫边控联动模块：纯数值推送的双向映射管道（核心 ⇄ 模块）。
 
-模块读取灵猫（BMTR）气压（0-60 kPa）与官方边控会话状态（DG-Lab 4.0 App
-经 Socket V4 上报的 ``edgeState`` 0-4，核心控制页「边控状态」同款语义），
-按配置模式跑**模块自动维护**的闭环状态机（判定条件与阈值自适应对标
-DG-Lab 官方边控玩法设置页，状态机内部直接计算并维护全部输出变量，不经
-事件流），产出两路强度映射变量（刺激器 / 惩罚器）：
+模块**不做任何设备管理**，全部数值经两张映射表流动：
+
+* 核心 → 模块（输出映射表，``META["reads"]`` 声明）：``BMTR.Pressure →
+  pressure``、``BMTR.EdgeState → edge``——从核心输出信号空间读入传感值，
+  换绑其它灵猫 = 改输出表行（如 ``BMTR.2.Pressure``）；
+* 模块 → 核心（输入映射表）：发布 ``stim_strength`` / ``punish_strength``
+  等命名数值，默认行 ``in_strength_a/b ← max({stim_strength},
+  {punish_strength})``——目标设备/通道完全由核心输入参数 id 决定
+  （``in_*`` 郊狼、``in_ovc_*`` 负鼠），模块只推数、不选设备。
+
+闭环状态机（判定条件与阈值自适应对标 DG-Lab 官方边控玩法设置页）：
 
 * ``sensor`` 气压闭环：红线/蓝线 + 持续判定 + 气压跳变判到边；最小冷静
   时间满且气压回落恢复；边控次数或会话时长达限进释放期（助力强度经刺激
-  器变量输出）；阈值自适应（边控后红线下降、超时缓降、蓝线跟随/回升）；
+  器变量输出）；阈值自适应（边控后红线下降、超时线性缓降有下限、蓝线
+  跟随/回升）；
 * ``app`` 跟随官方边控会话：刺激/冷静/允许高潮四态驱动变量；
 * ``off`` 只提供映射变量。
-
-**设备控制只经映射表**：状态机不直接调用设备命令，全部输出由输入映射表
-行引用 ``{stim_strength}`` 等变量落地（默认行取两路强度最大值驱动 A/B
-强度，可改写为任意核心输入参数）。
 
 META["config"] 声明全部配置项（分组对齐官方设置页），宿主装载
 config/margin_control.json 时自动补齐缺省，联动页据此渲染映射表与模块
@@ -24,11 +27,12 @@ config/margin_control.json 时自动补齐缺省，联动页据此渲染映射�
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.8.1",
-    "description": "灵猫气压 / 官方边控会话 → 闭环边控（模块自动维护）："
-                   "红线/蓝线 + 持续判定 + 气压跳变 + 有界阈值自适应，"
-                   "边控次数或时长达限释放；派发按家族严格定位防跨设备"
-                   "串扰，设备控制只经映射表传递。",
+    "version": "0.9.0",
+    "description": "灵猫气压 / 官方边控会话 → 闭环边控（纯数值推送）："
+                   "输出映射表读气压（BMTR.Pressure → pressure），输入"
+                   "映射表推强度（郊狼A ← max(刺激, 惩罚)）；红线/蓝线 + "
+                   "持续判定 + 气压跳变 + 有界阈值自适应，次数/时长达限"
+                   "释放。",
     "settings_key": "margin_control",
     "default_enabled": False,
     "actions": ["margin_reset_pressure", "margin_guard_toggle"],
@@ -48,6 +52,12 @@ META = {
         "cycles": {"label": "边控循环", "desc": "当前轮「到边→冷静」计数；释放完成"
                                               "后清零重新计"},
     },
+    # 可读参数：核心输出信号 → 模块读入变量（输出映射表默认行，可重定向）
+    "reads": {
+        "Pressure": {"label": "气压 (kPa)", "name": "pressure",
+                     "type": "Float"},
+        "EdgeState": {"label": "官方边控状态", "name": "edge", "type": "Int"},
+    },
     "config": {
         # ---- 基础设置 ----
         "mode": {
@@ -57,20 +67,6 @@ META = {
             "desc": "sensor=按气压判定自动边控（不依赖 App）；"
                     "app=跟随官方 App 边控会话（Socket V4，状态 0-4）；"
                     "off=不闭环，仅提供映射变量",
-        },
-        "sensor_slot": {
-            "label": "灵猫设备 (slot_id)", "type": "str", "default": "",
-            "group": "basic",
-            "desc": "留空用第一台灵猫（多台时在「控制」页查看 slot_id）",
-        },
-        "output_slot": {
-            "label": "目标输出设备 (slot_id/名称)", "type": "str",
-            "default": "", "group": "basic",
-            "desc": "强度派发落点：填 slot_id 或设备名（包含匹配，如"
-                    "「负鼠」），绑定后全部强度行都驱动该设备；留空自动"
-                    "跟随第一台输出设备（默认行参数随之切换 in_*/in_ovc_*，"
-                    "切换时旧设备归零）——强度永远只落一台设备，不跨设备"
-                    "串扰",
         },
         "smooth": {
             "label": "气压平滑", "type": "float",
@@ -249,15 +245,24 @@ META = {
             "desc": "叠加到气压读数上的固定补偿（腔体漏气读数偏低时调大；"
                     "官方默认 3）",
         },
-        # ---- 两张映射表之输入表（纯输入模块，无输出表） ----
+        # ---- 两张映射表（纯数值推送的双向管道） ----
         "mappings": {
-            "label": "输入映射表", "type": "list", "default": [],
-            "group": "map", "rows": "in",
+            "label": "输入映射表（模块 → 核心）", "type": "list",
+            "default": [], "group": "map", "rows": "in",
             "desc": "行 {param: 核心输入参数, expr: 表达式}，表达式以 "
                     "{stim_strength} {punish_strength} {pressure} "
-                    "{on_release} 等引用边控变量（设备控制的唯一通道），"
-                    "结果取整钳制后派发；表留空用默认行（刺激器/惩罚器"
-                    "最大值驱动 A/B 强度）",
+                    "{on_release} 等引用模块变量，结果取整钳制后派发；"
+                    "目标设备/通道由参数 id 决定（in_* 郊狼、in_ovc_* 负鼠、"
+                    "in_fire 开火…）。表留空用默认行（郊狼 A/B ← max(刺激, "
+                    "惩罚)）",
+        },
+        "outputs": {
+            "label": "输出映射表（核心 → 模块）", "type": "list",
+            "default": [], "group": "map", "rows": "out",
+            "desc": "行 {param: 核心输出信号, name: 模块读入变量名, expr, "
+                    "type}，求值结果作为模块输入（pressure/edge）。表留空"
+                    "用默认行（BMTR.Pressure → pressure、BMTR.EdgeState → "
+                    "edge）；多台灵猫换绑改 param（如 BMTR.2.Pressure）",
         },
     },
 }
@@ -270,6 +275,41 @@ from modules.margin_control.bridge import (PARAM_DEFS, MarginBridge,
 
 # 配置缺省值唯一来源 = META["config"] 声明，MarginConfig 仅做兜底
 MARGIN_CONFIG_DEFAULTS = spec_defaults(META["config"])
+
+
+def _signal_spec(signal: str) -> dict | None:
+    """核心输出信号名 → 参数定义（跨家族解析：郊狼 → 负鼠 → 灵猫取第一个
+    有该信号的家族），供输出表默认行落地。"""
+    from dglab.params import output_specs
+
+    for family in ("COYOTE", "OVC", "BMTR"):
+        for spec in output_specs(family, 1):
+            if spec["signal"] == signal:
+                return spec
+    return None
+
+
+def materialize_reads(settings: dict) -> bool:
+    """空输出表按 META["reads"] 落地默认可读行（``BMTR.Pressure →
+    pressure`` 等），写入设置文件；已有输出行则不动。"""
+    if any(isinstance(row, dict) and str(row.get("name") or "").strip()
+           for row in (settings.get("outputs") or [])):
+        return False
+    rows = []
+    for signal, item in META["reads"].items():
+        spec = _signal_spec(signal)
+        if spec is None:
+            continue
+        rows.append({"param": spec["key"],
+                     "name": str(item.get("name") or signal),
+                     "expr": "{" + spec["key"] + "}",
+                     "type": str(spec.get("type") or "Int")})
+    if not rows:
+        return False
+    settings["outputs"] = rows
+    if hasattr(settings, "save"):
+        settings.save()
+    return True
 
 
 class MarginControlModule(ModuleBase):
@@ -288,12 +328,18 @@ class MarginControlModule(ModuleBase):
         return dict(META["config"])
 
     def link_params(self) -> list[tuple[str, str]]:
-        """映射变量表（模块可写参数：气压 / 边控状态 / 两路强度 / 标志）。"""
+        """模块 → 核心的命名数值（输入映射表表达式变量池）。"""
         return [(name, str(item.get("label") or ""))
                 for name, item in PARAM_DEFS.items()]
 
+    def read_params(self) -> list[tuple[str, str]]:
+        """核心 → 模块的可读信号（输出映射表默认字段）。"""
+        return [(f"BMTR.{signal}", str(item.get("label") or signal))
+                for signal, item in META["reads"].items()]
+
     def on_load(self, ctx) -> None:
         self.ctx = ctx
+        materialize_reads(self.ctx.settings)
 
     def on_unload(self) -> None:
         if self.bridge is not None:

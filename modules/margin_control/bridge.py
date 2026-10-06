@@ -1,13 +1,20 @@
-"""灵猫边控桥接：气压 / 官方边控会话 → 闭环状态机 → 核心映射（唯一设备通道）。
+"""灵猫边控桥接：纯数值推送的双向映射管道（核心 ⇄ 模块）。
 
-数据流：引擎状态（灵猫槽位的 ``pressure`` 气压 kPa 与 ``edge_state`` 官方
-边控状态 0-4，控制页同款语义）→ 指数平滑 + 漏气补偿 → :class:`EdgeGuard`
-闭环状态机（每 0.1s 一拍，判定条件与阈值自适应对标 DG-Lab 官方边控玩法
-设置页）→ 七个映射变量喂进模块映射引擎 → **输入映射表**求值派发设备动作。
+**模块不做任何设备管理**——全部数值经两张映射表流动：
 
-**设备控制只经映射表**：状态机不直接调用任何设备命令，只产出两路强度
-变量（刺激器 / 惩罚器），由映射表行（默认行
-``max({stim_strength}, {punish_strength})`` 驱动 A/B 强度）落地。
+* 核心 → 模块（**输出映射表**）：默认行 ``BMTR.Pressure → pressure``、
+  ``BMTR.EdgeState → edge``，从核心输出信号空间读入传感值
+  （换绑其它灵猫 = 改输出表行，如 ``BMTR.2.Pressure``）；
+* 模块 → 核心（**输入映射表**）：模块发布命名数值（``stim_strength`` /
+  ``punish_strength`` …），默认行 ``in_strength_a/b ←
+  max({stim_strength}, {punish_strength})``——目标设备/通道完全由核心
+  输入参数 id 决定（``in_*`` 郊狼、``in_ovc_*`` 负鼠），派发只按核心
+  输入路由定位（各类型首台，跳过灵猫）。
+
+数据流：输出表求值 ``out_values`` → 指数平滑 + 漏气补偿 →
+:class:`EdgeGuard` 闭环状态机（每 0.1s 一拍，判定条件与阈值自适应对标
+DG-Lab 官方边控玩法设置页）→ 映射变量喂回模块映射引擎 → **输入映射表**
+求值派发。
 
 sensor 模式判定条件（对标官方「判定条件」页）：
 
@@ -17,8 +24,8 @@ sensor 模式判定条件（对标官方「判定条件」页）：
 * 蓝线（恢复气压阈值）：冷静期满最小冷静时间且气压低于蓝线判恢复；
   可要求**持续低于** N 秒；
 * 阈值自适应（官方「阈值自适应调整」）：刺激阶段每次成功边控后红线按
-  百分比下降、超时未到边红线缓慢下降，蓝线按比例跟随；冷静阶段超时未
-  恢复蓝线缓慢上升（恢复变容易）；红线/蓝线间保持安全间隙。
+  百分比下降、超时未到边红线缓慢下降（线性、有下限），蓝线按比例跟随；
+  冷静阶段超时未恢复蓝线缓慢上升（恢复变容易）；红线/蓝线间保持安全间隙。
 
 释放触发（满足其一即进释放期，助力强度经刺激器变量输出）：
 
@@ -80,14 +87,24 @@ PARAM_DEFS: dict[str, dict[str, str]] = {
                                           "后清零重新计"},
 }
 
-# 映射表为空时的默认行：刺激器/惩罚器取最大值驱动郊狼/负鼠 A/B 强度——
-# 刺激期与释放期 = 刺激器强度、到边惩罚窗口 = 惩罚器强度，其余时刻 0；
-# 改写行即可换目标参数（in_fire / in_ovc_strength_a …）
+# 模块 → 核心（输入映射表）默认行：刺激器/惩罚器取最大值推送郊狼 A/B
+# 强度——刺激期与释放期 = 刺激器强度、到边惩罚窗口 = 惩罚器强度，其余
+# 时刻 0；目标设备/通道由核心输入参数 id 决定（in_* 郊狼、in_ovc_* 负鼠），
+# 改写行即可换目标（in_fire / in_ovc_strength_a …）
 DEFAULT_MAPPINGS: list[dict[str, str]] = [
     {"param": "in_strength_a",
      "expr": "max({stim_strength}, {punish_strength})"},
     {"param": "in_strength_b",
      "expr": "max({stim_strength}, {punish_strength})"},
+]
+
+# 核心 → 模块（输出映射表）默认行：从核心输出信号空间读入传感值；
+# 换绑其它灵猫 = 改行参数 id（如 BMTR.2.Pressure）
+DEFAULT_OUTPUTS: list[dict[str, str]] = [
+    {"param": "BMTR.Pressure", "name": "pressure",
+     "expr": "{BMTR.Pressure}", "type": "Float"},
+    {"param": "BMTR.EdgeState", "name": "edge",
+     "expr": "{BMTR.EdgeState}", "type": "Int"},
 ]
 
 
@@ -96,7 +113,6 @@ class MarginConfig(dict):
 
     DEFAULTS = {
         "mode": "sensor",
-        "sensor_slot": "",
         "smooth": 0.5,
         "sensor_timeout_s": 5.0,
         # 判定条件
@@ -128,8 +144,9 @@ class MarginConfig(dict):
         "adapt_blue_rise_rate": 0.5,
         "adapt_blue_delay_s": 100.0,
         "leak_comp": 0.0,
-        # 映射表
+        # 映射表（输入 = 模块→核心推送，输出 = 核心→模块读数）
         "mappings": [],
+        "outputs": [],
     }
 
     def __init__(self, data: dict | None = None, defaults: dict | None = None):
@@ -467,7 +484,8 @@ class MarginBridge:
         self.paused = False
         self.guard = EdgeGuard(config)
         self._smoothed: float | None = None
-        self._last_pressure_at: float | None = None
+        self._last_pressure_seen: float | None = None
+        self._last_pressure_change: float | None = None
         self._last_offline_log = float("-inf")
         self._last_phase: int = PHASE_IDLE
         self.last_values: dict[str, float] = {}
@@ -485,58 +503,36 @@ class MarginBridge:
     # ---- 映射表 ---------------------------------------------------------
 
     def apply_config(self) -> None:
-        """装载映射表；首轮只静默求值，避免启动即把设备写成 0。
+        """装载两张映射表；首轮输入表只静默求值，避免启动即把设备写成 0。
 
-        默认行随目标设备家族动态生成（绑定/首台输出设备是负鼠 →
-        ``in_ovc_strength_*``）；家族切换时先把旧目标通道归零，防止
-        残留强度留在原设备上。
+        输入表（模块 → 核心）：空用默认行 ``in_strength_a/b``；
+        输出表（核心 → 模块）：空用默认行 ``BMTR.Pressure → pressure``、
+        ``BMTR.EdgeState → edge``。
         """
         first = not self._primed
         if first:
             self.engine.armed = False
-        rows = self._effective_rows()
-        old_keys = set(self.engine.mappings)
-        if not first and not self._user_rows():
-            new_keys = {str(row.get("param") or "") for row in rows}
-            for key in sorted(old_keys - new_keys):
-                if key.startswith(("in_", "in_ovc_")) \
-                        and "strength_" in key:
-                    self._dispatch(key, 0)   # 旧目标设备归零
-        self.engine.set_mappings(rows)
+        self.engine.set_mappings(self._effective_rows())
+        self.engine.set_outputs(self._effective_output_rows())
         if first:
             self.engine.armed = True
             self._primed = True
 
-    def _user_rows(self) -> list[dict]:
-        """用户自定义映射行（非空即完全取代默认行）。"""
-        return [row for row in (self.config.get("mappings") or [])
+    def _rows_of(self, key: str,
+                 fallback: list[dict[str, str]]) -> list[dict[str, str]]:
+        """用户映射行（非空即完全取代默认行）。"""
+        rows = [row for row in (self.config.get(key) or [])
                 if isinstance(row, dict)
                 and str(row.get("param") or "").strip()]
-
-    def _default_strength_prefix(self) -> str:
-        """默认行参数前缀跟随实际输出设备：绑定设备/首台输出设备是负鼠
-        → ``in_ovc_``，否则 ``in_``（郊狼）。"""
-        state = self._safe_state()
-        if state is not None:
-            target = self._explicit_output_slot(state)
-            if target is None:
-                for sid in sorted(state.slots):
-                    if state.slots[sid].is_output_device:
-                        target = sid
-                        break
-            if target is not None \
-                    and family_of(state.slots[target].type) == "OVC":
-                return "in_ovc_"
-        return "in_"
+        return rows or [dict(row) for row in fallback]
 
     def _effective_rows(self) -> list[dict]:
-        rows = self._user_rows()
-        if rows:
-            return rows
-        prefix = self._default_strength_prefix()
-        expr = "max({stim_strength}, {punish_strength})"
-        return [{"param": f"{prefix}strength_a", "expr": expr},
-                {"param": f"{prefix}strength_b", "expr": expr}]
+        """模块 → 核心（输入映射表）。"""
+        return self._rows_of("mappings", DEFAULT_MAPPINGS)
+
+    def _effective_output_rows(self) -> list[dict]:
+        """核心 → 模块（输出映射表）。"""
+        return self._rows_of("outputs", DEFAULT_OUTPUTS)
 
     def _safe_state(self):
         try:
@@ -560,7 +556,8 @@ class MarginBridge:
             self.log(f"映射派发 {target}={value} 失败: {exc!r}")
 
     class _DeviceApi:
-        """把引擎命令层适配成核心参数派发器需要的接口（仅映射表派发用）。"""
+        """核心参数派发器适配（纯数值推送）：模块不管理设备，仅按核心
+        输入路由定位（各类型首台，跳过灵猫）——与核心输入定位语义一致。"""
 
         def __init__(self, bridge: "MarginBridge"):
             self._b = bridge
@@ -570,34 +567,18 @@ class MarginBridge:
             return self._b.commands
 
         def resolve_slot(self, family: str = "") -> str | None:
-            """映射派发的目标设备（杜绝跨设备串扰）：
-
-            1. 显式绑定（``output_slot`` 设置，slot_id 或设备名）优先——
-               在线即用（绑定即用户明确指定落点，不再按家族改判）；
-            2. 否则严格按家族取排序第一台；
-            3. 家族设备不在线时**不跨家族回退**（返回 None 跳过派发，
-               记限流日志）——防止郊狼闪断/离线时强度落到负鼠等其它
-               设备；BMTR 永不作为输出目标。
-            """
             state = self._b._safe_state()
             if state is None:
                 return None
-            slots = {sid: state.slots[sid] for sid in sorted(state.slots)}
-            explicit = self._b._explicit_output_slot(state)
-            if explicit is not None:
-                self._b._note_target(family, explicit, state)
-                return explicit
+            slots = state.slots or {}
             if family:
-                for sid, slot in slots.items():
-                    if family_of(slot.type) == family:
-                        self._b._note_target(family, sid, state)
+                for sid in sorted(slots):
+                    if family_of(slots[sid].type) == family:
                         return sid
-            elif slots:
-                for sid, slot in slots.items():
-                    if family_of(slot.type) != "BMTR":
-                        self._b._note_target(family, sid, state)
-                        return sid
-            self._b._log_unrouted(family)
+                return None
+            for sid in sorted(slots):
+                if family_of(slots[sid].type) != "BMTR":
+                    return sid
             return None
 
         def wave_order(self, family: str = "") -> list[str]:
@@ -628,60 +609,6 @@ class MarginBridge:
 
         def run(self, coro) -> None:
             self._b._spawn(coro)
-
-    # ---- 设备定位（映射表派发用） ----------------------------------------
-
-    def _sensor_slot(self, state):
-        """绑定的灵猫槽位：配置 slot_id 优先，否则第一台 BMTR。"""
-        if state is None:
-            return None
-        want = str(self.config.get("sensor_slot") or "").strip()
-        if want and want in state.slots:
-            return state.slots[want]
-        for sid in sorted(state.slots):
-            if family_of(state.slots[sid].type) == "BMTR":
-                return state.slots[sid]
-        return None
-
-    def _explicit_output_slot(self, state) -> str | None:
-        """配置绑定的目标输出设备：slot_id 精确匹配优先，其次设备名包含
-        匹配（不区分大小写）；仅接受在线的输出设备。"""
-        want = str(self.config.get("output_slot") or "").strip()
-        if not want:
-            return None
-        slots = state.slots or {}
-        if want in slots and slots[want].is_output_device:
-            return want
-        low = want.lower()
-        for sid in sorted(slots):
-            slot = slots[sid]
-            if slot.is_output_device and low in str(slot.name or "").lower():
-                return sid
-        return None
-
-    def _log_unrouted(self, family: str) -> None:
-        """派发目标缺失的限流提示（30s 至多一条）。"""
-        now = self._clock()
-        if now - getattr(self, "_last_unrouted_log", float("-inf")) < 30.0:
-            return
-        self._last_unrouted_log = now
-        bound = str(self.config.get("output_slot") or "").strip()
-        hint = f"绑定的设备「{bound}」不在线或未匹配" if bound \
-            else f"{family or '输出'}家族设备不在线"
-        self.log(f"映射派发目标缺失（{hint}），本轮强度不派发")
-
-    def _note_target(self, family: str, sid: str | None,
-                     state) -> None:
-        """派发目标变化提示（每次变化一条）：让强度落点在日志里可见。"""
-        key = f"{family}:{sid or ''}"
-        if getattr(self, "_last_target_key", None) == key:
-            return
-        self._last_target_key = key
-        if not sid:
-            return
-        slot = (state.slots or {}).get(sid) if state is not None else None
-        name = str(getattr(slot, "name", "") or sid)
-        self.log(f"映射派发目标（{family or '默认'}）→ {name} ({sid})")
 
     # ---- 生命周期 -------------------------------------------------------
 
@@ -743,17 +670,22 @@ class MarginBridge:
 
     def _tick(self) -> None:
         cfg = self.config
-        state = self._safe_state()
-        slot = self._sensor_slot(state)
-        raw = slot.pressure if slot is not None else None
-        edge = slot.edge_state if slot is not None else None
+        # 核心 → 模块：刷新输出表求值（out_values 从核心输出信号空间取数）
+        self.engine.pump()
+        raw = self.engine.out_values.get("pressure")
+        edge = self.engine.out_values.get("edge")
         now = self._clock()
 
+        # 失联/无读数判定：气压 > 0 才是有效读数（设备离线时输出表恒为
+        # 0.0；「气压清零」后静息同样为 0，闭环待机等真实压力）；读数为正
+        # 但在 sensor_timeout_s 内无任何变化同样视为失联（设备读数冻结）
         timeout = max(1.0, self._cfg_f(cfg, "sensor_timeout_s", 5.0))
-        if raw is not None:
-            self._last_pressure_at = now
-        fresh = (self._last_pressure_at is not None
-                 and now - self._last_pressure_at <= timeout)
+        if raw is not None and raw != self._last_pressure_seen:
+            self._last_pressure_seen = raw
+            self._last_pressure_change = now
+        fresh = (raw is not None and raw > 0.0
+                 and self._last_pressure_change is not None
+                 and now - self._last_pressure_change <= timeout)
 
         smooth = min(0.95, max(0.0, self._cfg_f(cfg, "smooth", 0.5)))
         if raw is not None:
@@ -776,6 +708,7 @@ class MarginBridge:
         stim, punish = self.guard.outputs(now)
         on_edge = 1 if (pressure is not None and fresh
                         and pressure >= self.guard.red_threshold()) else 0
+        # 模块 → 核心：映射变量发布（输入映射表引用后派发）
         self.engine.signal("pressure", round(pressure or 0.0, 2))
         self.engine.signal("edge", int(edge) if edge is not None else 0)
         self.engine.signal("stim_strength", stim)
@@ -817,11 +750,12 @@ class MarginBridge:
         if now - self._last_offline_log < 30.0:
             return
         self._last_offline_log = now
-        if self._last_pressure_at is None:
-            self.log("未发现灵猫气压读数（确认灵猫已连接，"
-                     "或「灵猫设备」绑定正确）；闭环待机中")
+        if self._last_pressure_seen is None:
+            self.log("尚未读到有效气压（>0 kPa；确认灵猫已连接，"
+                     "或检查输出映射表的 BMTR.Pressure 行）；闭环待机中")
         else:
-            self.log("灵猫气压停止更新（可能失联），闭环归零待机中")
+            self.log("灵猫气压无有效读数（归零/失联/读数冻结），"
+                     "闭环归零待机中")
 
     def _spawn(self, coro) -> None:
         loop = self._loop
