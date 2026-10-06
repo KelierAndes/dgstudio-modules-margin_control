@@ -485,20 +485,58 @@ class MarginBridge:
     # ---- 映射表 ---------------------------------------------------------
 
     def apply_config(self) -> None:
-        """装载映射表；首轮只静默求值，避免启动即把设备写成 0。"""
+        """装载映射表；首轮只静默求值，避免启动即把设备写成 0。
+
+        默认行随目标设备家族动态生成（绑定/首台输出设备是负鼠 →
+        ``in_ovc_strength_*``）；家族切换时先把旧目标通道归零，防止
+        残留强度留在原设备上。
+        """
         first = not self._primed
         if first:
             self.engine.armed = False
-        self.engine.set_mappings(self._effective_rows())
+        rows = self._effective_rows()
+        old_keys = set(self.engine.mappings)
+        if not first and not self._user_rows():
+            new_keys = {str(row.get("param") or "") for row in rows}
+            for key in sorted(old_keys - new_keys):
+                if key.startswith(("in_", "in_ovc_")) \
+                        and "strength_" in key:
+                    self._dispatch(key, 0)   # 旧目标设备归零
+        self.engine.set_mappings(rows)
         if first:
             self.engine.armed = True
             self._primed = True
 
-    def _effective_rows(self) -> list[dict]:
-        rows = [row for row in (self.config.get("mappings") or [])
+    def _user_rows(self) -> list[dict]:
+        """用户自定义映射行（非空即完全取代默认行）。"""
+        return [row for row in (self.config.get("mappings") or [])
                 if isinstance(row, dict)
                 and str(row.get("param") or "").strip()]
-        return rows or [dict(row) for row in DEFAULT_MAPPINGS]
+
+    def _default_strength_prefix(self) -> str:
+        """默认行参数前缀跟随实际输出设备：绑定设备/首台输出设备是负鼠
+        → ``in_ovc_``，否则 ``in_``（郊狼）。"""
+        state = self._safe_state()
+        if state is not None:
+            target = self._explicit_output_slot(state)
+            if target is None:
+                for sid in sorted(state.slots):
+                    if state.slots[sid].is_output_device:
+                        target = sid
+                        break
+            if target is not None \
+                    and family_of(state.slots[target].type) == "OVC":
+                return "in_ovc_"
+        return "in_"
+
+    def _effective_rows(self) -> list[dict]:
+        rows = self._user_rows()
+        if rows:
+            return rows
+        prefix = self._default_strength_prefix()
+        expr = "max({stim_strength}, {punish_strength})"
+        return [{"param": f"{prefix}strength_a", "expr": expr},
+                {"param": f"{prefix}strength_b", "expr": expr}]
 
     def _safe_state(self):
         try:
@@ -534,8 +572,8 @@ class MarginBridge:
         def resolve_slot(self, family: str = "") -> str | None:
             """映射派发的目标设备（杜绝跨设备串扰）：
 
-            1. 显式绑定（``output_slot`` 设置）优先——存在且在线即用
-               （绑定即用户明确指定落点，不再按家族改判）；
+            1. 显式绑定（``output_slot`` 设置，slot_id 或设备名）优先——
+               在线即用（绑定即用户明确指定落点，不再按家族改判）；
             2. 否则严格按家族取排序第一台；
             3. 家族设备不在线时**不跨家族回退**（返回 None 跳过派发，
                记限流日志）——防止郊狼闪断/离线时强度落到负鼠等其它
@@ -547,14 +585,17 @@ class MarginBridge:
             slots = {sid: state.slots[sid] for sid in sorted(state.slots)}
             explicit = self._b._explicit_output_slot(state)
             if explicit is not None:
+                self._b._note_target(family, explicit, state)
                 return explicit
             if family:
                 for sid, slot in slots.items():
                     if family_of(slot.type) == family:
+                        self._b._note_target(family, sid, state)
                         return sid
             elif slots:
                 for sid, slot in slots.items():
                     if family_of(slot.type) != "BMTR":
+                        self._b._note_target(family, sid, state)
                         return sid
             self._b._log_unrouted(family)
             return None
@@ -603,22 +644,44 @@ class MarginBridge:
         return None
 
     def _explicit_output_slot(self, state) -> str | None:
-        """配置绑定的目标输出设备（存在且在线、非传感器才生效）。"""
+        """配置绑定的目标输出设备：slot_id 精确匹配优先，其次设备名包含
+        匹配（不区分大小写）；仅接受在线的输出设备。"""
         want = str(self.config.get("output_slot") or "").strip()
-        if want and want in (state.slots or {}) \
-                and state.slots[want].is_output_device:
+        if not want:
+            return None
+        slots = state.slots or {}
+        if want in slots and slots[want].is_output_device:
             return want
+        low = want.lower()
+        for sid in sorted(slots):
+            slot = slots[sid]
+            if slot.is_output_device and low in str(slot.name or "").lower():
+                return sid
         return None
 
     def _log_unrouted(self, family: str) -> None:
-        """家族设备全部离线时的限流提示（30s 至多一条）。"""
+        """派发目标缺失的限流提示（30s 至多一条）。"""
         now = self._clock()
         if now - getattr(self, "_last_unrouted_log", float("-inf")) < 30.0:
             return
         self._last_unrouted_log = now
-        self.log(f"映射派发目标缺失：{family or '输出'}设备不在线，"
-                 f"本轮强度不派发（可在「目标输出设备」绑定，或在映射表"
-                 f"改用 in_ovc_* 行驱动负鼠）")
+        bound = str(self.config.get("output_slot") or "").strip()
+        hint = f"绑定的设备「{bound}」不在线或未匹配" if bound \
+            else f"{family or '输出'}家族设备不在线"
+        self.log(f"映射派发目标缺失（{hint}），本轮强度不派发")
+
+    def _note_target(self, family: str, sid: str | None,
+                     state) -> None:
+        """派发目标变化提示（每次变化一条）：让强度落点在日志里可见。"""
+        key = f"{family}:{sid or ''}"
+        if getattr(self, "_last_target_key", None) == key:
+            return
+        self._last_target_key = key
+        if not sid:
+            return
+        slot = (state.slots or {}).get(sid) if state is not None else None
+        name = str(getattr(slot, "name", "") or sid)
+        self.log(f"映射派发目标（{family or '默认'}）→ {name} ({sid})")
 
     # ---- 生命周期 -------------------------------------------------------
 

@@ -537,16 +537,73 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- 问题 2 回归：派发目标不跨设备串扰 ----
 
-    def test_family_offline_no_cross_device_fallback(self):
-        """郊狼离线时默认行（COYOTE 家族）不派发、不落到负鼠。"""
+    def test_defaults_follow_available_output_device(self):
+        """默认行跟随实际输出设备：郊狼离线时负鼠接管（in_ovc_* 行），
+        且旧郊狼行被归零，不留残留强度。"""
         commands = _commands(pressure=10.0)
         commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
                                              type="OVC_1")
+        bridge, commands = _bridge({"ramp_s": 0.0}, commands)
+        bridge.tick_at(100.0)                   # 郊狼在线 → 郊狼 A/B
+        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
+        self.assertTrue(all(sid == "s_out"
+                            for _ch, _v, sid in commands.strength_calls))
         del commands.state.slots["s_out"]       # 郊狼离线
+        n_before = len(commands.strength_calls)
+        _run = bridge.reload_config()
+        _drain = asyncio.new_event_loop()
+        try:
+            _drain.run_until_complete(_run)
+        finally:
+            _drain.close()
+        bridge.tick_at(110.0)
+        # 负鼠接管：收到刺激强度；切换后旧郊狼通道只收到归零派发
+        after = commands.strength_calls[n_before:]
+        by_device: dict[str, list[tuple[str, int]]] = {}
+        for ch, v, sid in after:
+            by_device.setdefault(sid, []).append((ch, v))
+        self.assertIn("s_ovc", by_device)
+        self.assertEqual(sorted(by_device["s_ovc"]),
+                         [("A", 60), ("B", 60)])
+        if "s_out" in by_device:
+            self.assertTrue(all(v == 0 for _ch, v in by_device["s_out"]),
+                            by_device["s_out"])
+
+    def test_output_slot_by_name_binding(self):
+        """绑定支持设备名包含匹配（不区分大小写）。"""
+        commands = _commands(pressure=10.0)
+        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc",
+                                             name="负鼠 OVC 振动",
+                                             type="OVC_1")
+        bridge, commands = _bridge({"ramp_s": 0.0, "output_slot": "负鼠"},
+                                   commands)
+        bridge.tick_at(100.0)
+        self.assertTrue(commands.strength_calls)
+        self.assertTrue(all(sid == "s_ovc"
+                            for _ch, _v, sid in commands.strength_calls))
+
+    def test_default_rows_use_ovc_params_for_ovc_only(self):
+        """只有负鼠在线（无绑定）时，默认行自动改用 in_ovc_* 参数。"""
+        commands = _commands(pressure=10.0)
+        del commands.state.slots["s_out"]       # 仅负鼠
+        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
+                                             type="OVC_1")
         bridge, commands = _bridge({"ramp_s": 0.0}, commands)
         bridge.tick_at(100.0)
-        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
-        self.assertEqual(commands.strength_calls, [])   # 负鼠零派发
+        self.assertEqual(bridge.engine.mappings.get("in_ovc_strength_a"),
+                         "max({stim_strength}, {punish_strength})")
+        self.assertNotIn("in_strength_a", bridge.engine.mappings)
+        self.assertTrue(all(sid == "s_ovc"
+                            for _ch, _v, sid in commands.strength_calls))
+
+    def test_target_change_logged(self):
+        """派发目标变化时记日志（落点可见）。"""
+        bridge, commands = _bridge({"ramp_s": 0.0},
+                                   commands=_commands(pressure=10.0))
+        logs: list[str] = []
+        bridge.log = logs.append
+        bridge.tick_at(100.0)
+        self.assertTrue(any("派发目标" in msg for msg in logs))
 
     def test_output_slot_binding_drives_bound_device(self):
         """绑定目标输出设备后，全部强度行都驱动绑定设备。"""
@@ -757,7 +814,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.8.0")
+        self.assertEqual(meta["version"], "0.8.1")
         # 七个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
