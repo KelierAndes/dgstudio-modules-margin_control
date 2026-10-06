@@ -27,12 +27,12 @@ config/margin_control.json 时自动补齐缺省，联动页据此渲染映射�
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.9.0",
+    "version": "0.10.0",
     "description": "灵猫气压 / 官方边控会话 → 闭环边控（纯数值推送）："
                    "输出映射表读气压（BMTR.Pressure → pressure），输入"
-                   "映射表推强度（郊狼A ← max(刺激, 惩罚)）；红线/蓝线 + "
-                   "持续判定 + 气压跳变 + 有界阈值自适应，次数/时长达限"
-                   "释放。",
+                   "映射表/events 推送链（param ← var，如 郊狼A ← punish、"
+                   "负鼠A ← stim）按现有配置流转；红线/蓝线 + 持续判定 + "
+                   "跳变 + 有界自适应，次数/时长达限释放。",
     "settings_key": "margin_control",
     "default_enabled": False,
     "actions": ["margin_reset_pressure", "margin_guard_toggle"],
@@ -263,6 +263,23 @@ META = {
                     "type}，求值结果作为模块输入（pressure/edge）。表留空"
                     "用默认行（BMTR.Pressure → pressure、BMTR.EdgeState → "
                     "edge）；多台灵猫换绑改 param（如 BMTR.2.Pressure）",
+        },
+        # ---- 配置链推送（与映射表等价的传统书写，兼容既有配置） ----
+        "events": {
+            "label": "推送链（param ← var）", "type": "list",
+            "default": [], "group": "map",
+            "desc": "行 {name, trigger, arg, actions: [{dir: \"in\", "
+                    "param: 核心输入参数, var: 变量名}]}：把变量数值连续"
+                    "推送到核心参数（纯数值推送）。显式 mappings 行优先于"
+                    "本链；无 mappings 且无本链时用默认行（郊狼 A/B ← "
+                    "max(刺激, 惩罚)）",
+        },
+        "temps": {
+            "label": "派生变量", "type": "list", "default": [],
+            "group": "map",
+            "desc": "行 {name, expr}（每拍对模块变量求值，如 punish ← "
+                    "{punish_strength}）或 {name, value}（静态初值）；"
+                    "结果作为模块变量供推送链/映射表引用",
         },
     },
 }

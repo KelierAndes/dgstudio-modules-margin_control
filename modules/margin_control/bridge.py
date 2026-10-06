@@ -43,6 +43,7 @@ import time
 import traceback
 from typing import Any, Callable
 
+from dglab import expr as _expr
 from dglab.mapping import MappingEngine
 from dglab.params import (build_dispatchers, core_alias_values, core_inputs,
                           device_state_values, input_ranges)
@@ -55,6 +56,9 @@ __all__ = ["MarginBridge", "MarginConfig", "EdgeGuard", "PARAM_DEFS",
 
 # 闭环节拍：0.1s 一拍（与核心脉冲帧 / 音频联动的节奏一致）
 TICK_S = 0.1
+# 有效读数阈值 (kPa)：平滑 + 漏气补偿后的有效气压须高于此值（静息清零后
+# 读数在 0 附近抖动，ε 消除待机/刺激抖动）
+FRESH_EPSILON = 0.05
 # 单拍最大按秒推进量：暂停/失联恢复后自适应不瞬移
 MAX_STEP_DT = 5.0
 # 红蓝线安全间隙 (kPa)：蓝线永不超过红线 - GAP
@@ -505,7 +509,8 @@ class MarginBridge:
     def apply_config(self) -> None:
         """装载两张映射表；首轮输入表只静默求值，避免启动即把设备写成 0。
 
-        输入表（模块 → 核心）：空用默认行 ``in_strength_a/b``；
+        输入表（模块 → 核心）：显式 mappings 行 > 配置链 events 推送行
+        （``param ← var``）> 默认行 ``in_strength_a/b``；
         输出表（核心 → 模块）：空用默认行 ``BMTR.Pressure → pressure``、
         ``BMTR.EdgeState → edge``。
         """
@@ -514,9 +519,25 @@ class MarginBridge:
             self.engine.armed = False
         self.engine.set_mappings(self._effective_rows())
         self.engine.set_outputs(self._effective_output_rows())
+        self._seed_temps()
         if first:
             self.engine.armed = True
             self._primed = True
+
+    def _seed_temps(self) -> None:
+        """播种 temps 静态变量（行 {name, value}；重载不覆盖已有值；
+        {name, expr} 派生变量由 _publish_temps 每拍计算）。"""
+        for temp in self.config.get("temps") or []:
+            if not isinstance(temp, dict):
+                continue
+            name = str(temp.get("name") or "").strip()
+            if not name or "expr" in temp:
+                continue
+            try:
+                value = float(temp.get("value") or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            self.engine.signals.setdefault(name, value)
 
     def _rows_of(self, key: str,
                  fallback: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -526,13 +547,57 @@ class MarginBridge:
                 and str(row.get("param") or "").strip()]
         return rows or [dict(row) for row in fallback]
 
+    def _rows_from_events(self) -> list[dict[str, str]]:
+        """配置链 events → 输入映射行：动作 ``{dir: "in", param: 核心输入
+        参数, var: 变量名}`` 即纯数值推送行 ``param ← {var}``（var 来自
+        temps 派生变量或模块变量），每拍连续推送。"""
+        out: list[dict[str, str]] = []
+        for event in self.config.get("events") or []:
+            if not isinstance(event, dict):
+                continue
+            for action in event.get("actions") or []:
+                if not isinstance(action, dict):
+                    continue
+                if str(action.get("dir") or "in") != "in":
+                    continue
+                param = str(action.get("param") or "").strip()
+                var = str(action.get("var") or "").strip()
+                if param and var:
+                    out.append({"param": param, "expr": "{" + var + "}"})
+        return out
+
     def _effective_rows(self) -> list[dict]:
-        """模块 → 核心（输入映射表）。"""
-        return self._rows_of("mappings", DEFAULT_MAPPINGS)
+        """模块 → 核心（输入映射表）：显式 mappings 行优先；否则采用配置
+        链 events 声明的 ``param ← var`` 推送行；再否则默认行。"""
+        user = [row for row in (self.config.get("mappings") or [])
+                if isinstance(row, dict)
+                and str(row.get("param") or "").strip()]
+        if user:
+            return user
+        derived = self._rows_from_events()
+        if derived:
+            return derived
+        return [dict(row) for row in DEFAULT_MAPPINGS]
 
     def _effective_output_rows(self) -> list[dict]:
         """核心 → 模块（输出映射表）。"""
         return self._rows_of("outputs", DEFAULT_OUTPUTS)
+
+    def _publish_temps(self) -> None:
+        """temps 派生变量：行 {name, expr} 每拍对模块变量求值后发布
+        （{name, value} 静态播种由 _seed_temps 处理）。"""
+        for temp in self.config.get("temps") or []:
+            if not isinstance(temp, dict):
+                continue
+            name = str(temp.get("name") or "").strip()
+            expr = temp.get("expr")
+            if not name or not isinstance(expr, str) or not expr.strip():
+                continue
+            try:
+                value = float(_expr.evaluate(expr, self.engine.signals))
+            except _expr.ExprError:
+                continue
+            self.engine.signal(name, value)
 
     def _safe_state(self):
         try:
@@ -676,16 +741,16 @@ class MarginBridge:
         edge = self.engine.out_values.get("edge")
         now = self._clock()
 
-        # 失联/无读数判定：气压 > 0 才是有效读数（设备离线时输出表恒为
-        # 0.0；「气压清零」后静息同样为 0，闭环待机等真实压力）；读数为正
-        # 但在 sensor_timeout_s 内无任何变化同样视为失联（设备读数冻结）
+        # 失联/无读数判定：平滑 + 漏气补偿后的有效气压 > EPSILON 才是有效
+        # 读数（设备离线时输出表恒为 0.0；「气压清零」后静息在 0 附近抖动，
+        # ε 消除穿越 0 判界导致的待机/刺激抖动）；读数为正但在
+        # sensor_timeout_s 内无任何变化同样视为失联（设备读数冻结）
         timeout = max(1.0, self._cfg_f(cfg, "sensor_timeout_s", 5.0))
         if raw is not None and raw != self._last_pressure_seen:
             self._last_pressure_seen = raw
             self._last_pressure_change = now
-        fresh = (raw is not None and raw > 0.0
-                 and self._last_pressure_change is not None
-                 and now - self._last_pressure_change <= timeout)
+        changed_recently = (self._last_pressure_change is not None
+                            and now - self._last_pressure_change <= timeout)
 
         smooth = min(0.95, max(0.0, self._cfg_f(cfg, "smooth", 0.5)))
         if raw is not None:
@@ -697,6 +762,8 @@ class MarginBridge:
         leak = self._cfg_f(cfg, "leak_comp", 0.0)
         pressure = (self._smoothed + leak) if self._smoothed is not None \
             else None
+        fresh = (pressure is not None and pressure > FRESH_EPSILON
+                 and changed_recently)
 
         if self.paused:
             self.guard.reset(now)
@@ -706,8 +773,7 @@ class MarginBridge:
         self._log_phase()
 
         stim, punish = self.guard.outputs(now)
-        on_edge = 1 if (pressure is not None and fresh
-                        and pressure >= self.guard.red_threshold()) else 0
+        on_edge = 1 if fresh and pressure >= self.guard.red_threshold() else 0
         # 模块 → 核心：映射变量发布（输入映射表引用后派发）
         self.engine.signal("pressure", round(pressure or 0.0, 2))
         self.engine.signal("edge", int(edge) if edge is not None else 0)
@@ -717,6 +783,7 @@ class MarginBridge:
         self.engine.signal("on_release",
                            1 if self.guard.phase == PHASE_RELEASE else 0)
         self.engine.signal("cycles", self.guard.cycles)
+        self._publish_temps()
         self._refresh_last_values()
 
     def _refresh_last_values(self) -> None:

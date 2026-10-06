@@ -583,6 +583,71 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         bridge.tick_at(105.0)
         self.assertEqual(bridge.guard.phase, PHASE_STIM)
 
+    def test_user_config_chain_events_temps(self):
+        """现有配置链（events param←var + temps 派生）被原样执行：
+        郊狼A ← punish、负鼠A ← stim，双设备各收各的值。"""
+        commands = _commands(pressure=10.0)
+        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
+                                             type="OVC_1")
+        bridge, commands = _bridge(
+            {"ramp_s": 0.0, "smooth": 0.0,
+             "punish_strength": 100, "stim_strength": 60,
+             "events": [{"name": "帧事件流", "trigger": "period", "arg": 100,
+                         "actions": [
+                             {"dir": "in", "param": "in_strength_a",
+                              "var": "punish"},
+                             {"dir": "in", "param": "in_ovc_strength_a",
+                              "var": "stim"},
+                         ]}],
+             "temps": [{"name": "punish", "expr": "{punish_strength}"},
+                       {"name": "stim", "expr": "{stim_strength}"}]},
+            commands)
+        bridge.tick_at(100.0)
+        # 推送链成为输入映射行（默认行让位）
+        self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
+                         "{punish}")
+        self.assertEqual(bridge.engine.mappings.get("in_ovc_strength_a"),
+                         "{stim}")
+        self.assertNotIn("in_strength_b", bridge.engine.mappings)
+        # 刺激期：负鼠A ← stim 60；郊狼A ← punish 0（惩罚窗口未开）
+        by_target = {(ch, sid): v for ch, v, sid in commands.strength_calls}
+        self.assertEqual(by_target[("A", "s_ovc")], 60)    # 负鼠A ← stim
+        # 到边 → 惩罚窗口：郊狼A ← punish 100；冷静期撤除刺激 → 负鼠A ← 0
+        commands.state.slots["s_bmt"].pressure = 45.0
+        bridge.tick_at(110.0)
+        by_target = {(ch, sid): v for ch, v, sid in commands.strength_calls}
+        self.assertEqual(by_target[("A", "s_out")], 100)   # 郊狼A ← punish
+        self.assertEqual(by_target[("A", "s_ovc")], 0)     # 负鼠A ← stim(冷静=0)
+        self.assertNotIn(("B", "s_out"), by_target)        # 郊狼B 无推送
+        self.assertNotIn(("B", "s_ovc"), by_target)
+
+    def test_user_mappings_override_events_chain(self):
+        """显式 mappings 行优先于 events 推送链。"""
+        bridge, _ = _bridge(
+            {"mappings": [{"param": "in_strength_a", "expr": "{on_edge}"}],
+             "events": [{"actions": [{"dir": "in",
+                                      "param": "in_strength_b",
+                                      "var": "punish"}]}]})
+        self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
+                         "{on_edge}")
+        self.assertNotIn("in_strength_b", bridge.engine.mappings)
+
+    def test_zero_noise_no_idle_flap(self):
+        """静息清零后读数在 0 附近抖动：ε 阈值消除待机/刺激抖动。"""
+        commands = _commands(pressure=0.0)
+        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0},
+                                   commands=_commands(pressure=0.0))
+        bridge.guard  # noqa
+        phases = []
+        t = 100.0
+        for i in range(20):
+            t += 0.1
+            # 0 ↔ 0.03 噪声穿越 0 判界（ε=0.05 以下应保持待机）
+            commands.state.slots["s_bmt"].pressure = 0.03 if i % 2 else 0.0
+            bridge.tick_at(t)
+            phases.append(bridge.guard.phase)
+        self.assertNotIn(PHASE_STIM, phases)        # 全程待机，无抖动
+
     def test_fixed_default_rows_push_core_params(self):
         """默认行固定为 in_strength_a/b（模块只推数，设备由核心路由）。"""
         commands = _commands(pressure=10.0)
@@ -769,7 +834,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.9.0")
+        self.assertEqual(meta["version"], "0.10.0")
         # 七个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
