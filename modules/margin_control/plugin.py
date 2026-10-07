@@ -27,12 +27,11 @@ config/margin_control.json 时自动补齐缺省，联动页据此渲染映射�
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.10.0",
+    "version": "0.11.0",
     "description": "灵猫气压 / 官方边控会话 → 闭环边控（纯数值推送）："
-                   "输出映射表读气压（BMTR.Pressure → pressure），输入"
-                   "映射表/events 推送链（param ← var，如 郊狼A ← punish、"
-                   "负鼠A ← stim）按现有配置流转；红线/蓝线 + 持续判定 + "
-                   "跳变 + 有界自适应，次数/时长达限释放。",
+                   "数值只经映射表流动（输出表读气压、输入表/推送链推"
+                   "强度，零内置兜底行）；达限后的下一次到边即释放边"
+                   "（不惩罚、刺激器=助力、循环置零）。",
     "settings_key": "margin_control",
     "default_enabled": False,
     "actions": ["margin_reset_pressure", "margin_guard_toggle"],
@@ -261,8 +260,8 @@ META = {
             "default": [], "group": "map", "rows": "out",
             "desc": "行 {param: 核心输出信号, name: 模块读入变量名, expr, "
                     "type}，求值结果作为模块输入（pressure/edge）。表留空"
-                    "用默认行（BMTR.Pressure → pressure、BMTR.EdgeState → "
-                    "edge）；多台灵猫换绑改 param（如 BMTR.2.Pressure）",
+                    "全空 = 不读任何设备数据（模块零内置兜底行，链路只"
+                    "来自配置；装载时空表会按「可读参数」补默认行）",
         },
         # ---- 配置链推送（与映射表等价的传统书写，兼容既有配置） ----
         "events": {

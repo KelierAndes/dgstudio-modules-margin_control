@@ -23,7 +23,7 @@ import _bootstrap  # noqa: F401  定位核心仓库并挂 sys.path
 from dglab.state import EngineState, Slot
 from dglab.waves import SILENT
 
-from modules.margin_control.bridge import (DEFAULT_MAPPINGS, PARAM_DEFS,
+from modules.margin_control.bridge import (PARAM_DEFS,
                                            EdgeGuard, MarginBridge,
                                            MarginConfig, PHASE_COOL,
                                            PHASE_IDLE, PHASE_RELEASE,
@@ -145,12 +145,37 @@ def _commands(pressure: float | None = None,
     return commands
 
 
+# 测试链（等价于用户运行时配置的写法）：输出表读灵猫气压，推送链把
+# 刺激器变量推到郊狼 A/B；模块自身零内置兜底，链路只来自配置
+_TEST_OUTPUTS = [
+    {"param": "BMTR.Pressure", "name": "pressure",
+     "expr": "{BMTR.Pressure}", "type": "Float"},
+    {"param": "BMTR.EdgeState", "name": "edge",
+     "expr": "{BMTR.EdgeState}", "type": "Int"},
+]
+_TEST_PUSH = [{"name": "推送", "trigger": "period", "arg": 100,
+               "actions": [
+                   {"dir": "in", "param": "in_strength_a",
+                    "var": "stim_strength"},
+                   {"dir": "in", "param": "in_strength_b",
+                    "var": "stim_strength"}]}]
+
+
 def _bridge(config: dict | None = None, commands: FakeCommands | None = None,
             clock: float = 100.0) -> tuple[MarginBridge, FakeCommands]:
-    """带假命令层的桥接器（时钟固定，测试里用 tick_at 手动推进）。"""
+    """带假命令层的桥接器（时钟固定，测试里用 tick_at 手动推进）。
+
+    测试链注入：配置未声明 ``outputs`` 时补输出行（读灵猫气压），未声明
+    ``mappings``/``events`` 时补推送链（刺激器 → 郊狼 A/B）——模拟用户
+    运行时配置；空链场景的测试显式传 ``outputs``/``events``。
+    """
     commands = commands or _commands()
     merged = dict(_FAST_JUDGE)
     merged.update(config or {})
+    if "outputs" not in merged:
+        merged["outputs"] = _TEST_OUTPUTS
+    if "mappings" not in merged and "events" not in merged:
+        merged["events"] = _TEST_PUSH
     bridge = MarginBridge(MarginConfig(merged), commands.get_state, commands)
     bridge.log = lambda msg: None
     bridge._clock = lambda: clock
@@ -375,58 +400,65 @@ class GuardSensorTests(unittest.TestCase):
         guard2.step(45.0, None, True, now=3.0)
         self.assertAlmostEqual(guard2.blue_threshold(), 15.0)
 
-    # ---- 释放触发（次数 / 持续时长） ----
+    # ---- 释放边语义（次数 / 持续时长达限后的下一次到边） ----
 
-    def test_cycle_limit_triggers_release_then_restarts(self):
+    def test_cycle_limit_release_at_next_edge(self):
+        """达限后的下一次到边 = 释放边：不设惩罚器、刺激器=助力、循环置零。"""
         guard = self._guard(ramp_s=0.0, cooldown_s=5.0,
                             recovery_threshold=20.0, cycle_limit=2,
                             stim_strength=60, assist_strength=80,
-                            release_s=15.0)
-        # 第 1 轮：到边 → 冷静 → 恢复（未达上限，回刺激）
+                            release_s=15.0, punish_strength=100,
+                            punish_s=1.0)
+        # 第 1 轮：到边 → 冷静（惩罚窗口开启，循环 +1）→ 恢复
         guard.step(10.0, None, True, now=0.0)
         guard.step(45.0, None, True, now=1.0)
         self.assertEqual((guard.phase, guard.cycles), (PHASE_COOL, 1))
+        self.assertGreater(guard.punish_until, 0.0)
         guard.step(5.0, None, True, now=10.0)
         self.assertEqual(guard.phase, PHASE_STIM)
-        # 第 2 轮：到边 → 冷静 → 达上限，进释放
+        # 第 2 轮：到边 → 冷静（循环 2 = 达限）→ 恢复
         guard.step(45.0, None, True, now=20.0)
         self.assertEqual((guard.phase, guard.cycles), (PHASE_COOL, 2))
         guard.step(5.0, None, True, now=30.0)
+        self.assertEqual(guard.phase, PHASE_STIM)
+        # 达限后的下一次到边 = 释放边：无惩罚窗口、刺激器=助力、循环置零
+        guard.step(45.0, None, True, now=40.0)
         self.assertEqual(guard.phase, PHASE_RELEASE)
-        # 助力强度经刺激器变量输出（不爬升）
-        self.assertEqual(guard.outputs(30.0), (80, 0))
-        # 释放计时（15s）满 → 循环计数清零、回到刺激
-        guard.step(5.0, None, True, now=44.0)
+        self.assertEqual(guard.cycles, 0)
+        # 不设惩罚器（输出惩罚路为 0；旧窗口时间戳已过期）
+        self.assertEqual(guard.outputs(40.0), (80, 0))  # 刺激器=助力
+        # 释放计时（15s）满 → 回刺激（循环已从 0 重新计）
+        guard.step(5.0, None, True, now=54.0)
         self.assertEqual(guard.phase, PHASE_RELEASE)
-        guard.step(5.0, None, True, now=46.0)
+        guard.step(5.0, None, True, now=56.0)
         self.assertEqual((guard.phase, guard.cycles), (PHASE_STIM, 0))
 
-    def test_time_release_after_session_duration(self):
-        """官方「游戏进行指定时长后，允许高潮释放」。"""
-        guard = self._guard(time_release_s=30.0, assist_strength=80)
-        guard.step(10.0, None, True, now=0.0)     # 会话开始（首次进刺激）
-        guard.step(10.0, None, True, now=29.0)
+    def test_time_release_allowed_at_next_edge(self):
+        """官方「游戏进行指定时长后允许高潮释放」：达限后的下一次到边
+        才进释放（时长未满时到边仍走冷静惩罚）。"""
+        guard = self._guard(time_release_s=30.0, assist_strength=80,
+                            punish_strength=100, cooldown_s=5.0)
+        guard.step(10.0, None, True, now=0.0)     # 会话开始
+        guard.step(45.0, None, True, now=10.0)    # 时长未满 → 冷静边
+        self.assertEqual(guard.phase, PHASE_COOL)
+        self.assertGreater(guard.punish_until, 0.0)
+        guard.step(5.0, None, True, now=20.0)     # 恢复（等待 10s ≥ 5）
         self.assertEqual(guard.phase, PHASE_STIM)
-        guard.step(10.0, None, True, now=31.0)    # 会话 31s ≥ 30 → 释放
+        guard.step(45.0, None, True, now=31.0)    # 会话 ≥ 30 → 释放边
         self.assertEqual(guard.phase, PHASE_RELEASE)
+        self.assertEqual(guard.cycles, 0)
+        # 释放边不设惩罚器：输出惩罚路为 0（旧窗口时间戳已过期）
         self.assertEqual(guard.outputs(31.0), (80, 0))
-
-    def test_time_release_also_applies_at_cool_completion(self):
-        guard = self._guard(time_release_s=30.0, cooldown_s=5.0,
-                            recovery_threshold=20.0, cycle_limit=0)
-        guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=10.0)    # 到边（会话 10s）
-        guard.step(5.0, None, True, now=40.0)     # 冷静期满且会话 ≥ 30s
-        self.assertEqual(guard.phase, PHASE_RELEASE)
 
     def test_release_holds_indefinitely_when_release_s_zero(self):
         guard = self._guard(cooldown_s=0.0, recovery_threshold=20.0,
                             cycle_limit=1, release_s=0.0)
         guard.step(10.0, None, True, now=0.0)
-        guard.step(45.0, None, True, now=1.0)
-        guard.step(5.0, None, True, now=100.0)
+        guard.step(45.0, None, True, now=1.0)     # 冷静边（循环 1 = 达限）
+        guard.step(5.0, None, True, now=2.0)      # 恢复
+        guard.step(45.0, None, True, now=3.0)     # 释放边
         self.assertEqual(guard.phase, PHASE_RELEASE)
-        guard.step(5.0, None, True, now=999.0)
+        guard.step(45.0, None, True, now=999.0)
         self.assertEqual(guard.phase, PHASE_RELEASE)      # 一直保持
 
     def test_release_exits_via_failover_only(self):
@@ -436,6 +468,7 @@ class GuardSensorTests(unittest.TestCase):
         guard.step(10.0, None, True, now=0.0)
         guard.step(45.0, None, True, now=1.0)
         guard.step(5.0, None, True, now=2.0)
+        guard.step(45.0, None, True, now=3.0)     # 释放边
         self.assertEqual(guard.phase, PHASE_RELEASE)
         guard.step(None, None, False, now=50.0)
         self.assertEqual(guard.phase, PHASE_IDLE)
@@ -648,15 +681,16 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
             phases.append(bridge.guard.phase)
         self.assertNotIn(PHASE_STIM, phases)        # 全程待机，无抖动
 
-    def test_fixed_default_rows_push_core_params(self):
-        """默认行固定为 in_strength_a/b（模块只推数，设备由核心路由）。"""
+    def test_push_chain_rows_push_core_params(self):
+        """推送链行 = in_strength_a/b ← {stim_strength}（模块只推数，
+        设备由核心输入路由解析：各类型首台，跳过灵猫）。"""
         commands = _commands(pressure=10.0)
         bridge, commands = _bridge({"ramp_s": 0.0}, commands)
         bridge.tick_at(100.0)
         self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
-                         "max({stim_strength}, {punish_strength})")
+                         "{stim_strength}")
         self.assertEqual(bridge.engine.mappings.get("in_strength_b"),
-                         "max({stim_strength}, {punish_strength})")
+                         "{stim_strength}")
         # 派发携带核心参数 id（in_strength_a），设备按核心输入路由解析
         # （各类型首台，跳过灵猫）
         dispatched = {(ch, sid) for ch, _v, sid in commands.strength_calls}
@@ -698,27 +732,42 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge2.engine.signals["on_edge"], 1)  # 18 ≥ 17
 
     def test_on_release_flag_follows_phase(self):
+        """达限后的下一次到边 = 释放边：on_release=1、刺激器=助力、
+        惩罚器不设（保持 0）。"""
         bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
                                     "cooldown_s": 0.0,
                                     "recovery_threshold": 20.0,
                                     "cycle_limit": 1, "release_s": 0.0,
-                                    "assist_strength": 90},
+                                    "assist_strength": 90,
+                                    "punish_strength": 120},
                                    commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
         self.assertEqual(bridge.engine.signals["on_release"], 0)
         commands.state.slots["s_bmt"].pressure = 45.0
-        bridge.tick_at(110.0)                     # 到边 → 冷静
+        bridge.tick_at(110.0)                     # 第 1 次到边 → 冷静边
         self.assertEqual(bridge.engine.signals["on_release"], 0)
         commands.state.slots["s_bmt"].pressure = 5.0
-        bridge.tick_at(120.0)                     # 冷静期满 → 释放
+        bridge.tick_at(120.0)                     # 恢复
+        commands.state.slots["s_bmt"].pressure = 45.0
+        bridge.tick_at(130.0)                     # 第 2 次到边 = 释放边
         self.assertEqual(bridge.engine.signals["on_release"], 1)
+        self.assertEqual(bridge.engine.signals["punish_strength"], 0)
         self.assertEqual(_strength_by_channel(commands), {"A": 90, "B": 90})
 
     def test_crossing_drives_punish_through_mapping(self):
-        """到边 → 冷静 + 惩罚窗口：默认行派发惩罚器强度，窗口过后归零。"""
+        """到边 → 冷静 + 惩罚窗口：推送链（max(刺激,惩罚) 组合）派发惩罚
+        强度，窗口过后归零。"""
         bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
                                     "punish_strength": 120,
-                                    "punish_s": 1.0},
+                                    "punish_s": 1.0,
+                                    "temps": [{"name": "out",
+                                               "expr": "max({stim_strength},"
+                                                       " {punish_strength})"}],
+                                    "events": [
+                   {"name": "推送", "trigger": "period", "arg": 100,
+                    "actions": [
+                        {"dir": "in", "param": "in_strength_a", "var": "out"},
+                        {"dir": "in", "param": "in_strength_b", "var": "out"}]}]},
                                    commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
         self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
@@ -803,7 +852,7 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
     async def test_reload_config_hot_swaps_mappings(self):
         bridge, _ = _bridge()
         self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
-                         "max({stim_strength}, {punish_strength})")
+                         "{stim_strength}")
         bridge.config["mappings"] = [
             {"param": "in_strength_a", "expr": "{punish_strength}"},
         ]
@@ -834,7 +883,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.10.0")
+        self.assertEqual(meta["version"], "0.11.0")
         # 七个映射变量与 bridge PARAM_DEFS 一致
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
@@ -896,29 +945,20 @@ class PluginContractTests(unittest.TestCase):
         self.assertTrue(all(isinstance(a, ButtonAction) for a in actions))
         self.assertTrue(all(callable(a.on_press) for a in actions))
 
-    def test_default_mappings_target_core_inputs(self):
-        """默认行引用的变量都存在，目标都是核心输入参数（映射表唯一通道）。"""
-        from dglab.params import input_specs
-
-        specs = input_specs()
-        for row in DEFAULT_MAPPINGS:
-            self.assertIn(row["param"], specs)
-            self.assertEqual(row["expr"],
-                             "max({stim_strength}, {punish_strength})")
-
-    def test_default_expr_evaluates_per_phase(self):
-        """默认表达式在状态机各阶段求值符合预期（刺激器/惩罚器取最大）。"""
-        from dglab.expr import evaluate
-
-        row = DEFAULT_MAPPINGS[0]["expr"]
-        self.assertEqual(evaluate(row, {"stim_strength": 60.0,
-                                        "punish_strength": 0.0}), 60.0)
-        self.assertEqual(evaluate(row, {"stim_strength": 0.0,
-                                        "punish_strength": 120.0}), 120.0)
-        self.assertEqual(evaluate(row, {"stim_strength": 60.0,
-                                        "punish_strength": 120.0}), 120.0)
-        self.assertEqual(evaluate(row, {"stim_strength": 0.0,
-                                        "punish_strength": 0.0}), 0.0)
+    def test_no_builtin_fallback_rows(self):
+        """模块零内置兜底映射行：设备数据/推送只来自配置映射表。"""
+        bridge, commands = _bridge({"ramp_s": 0.0},
+                                   commands=_commands(pressure=10.0))
+        # _bridge 测试助手注入的推送链来自测试常量，而非模块内置行；
+        # 直接构造空配置链的桥接器验证零兜底
+        bare = MarginBridge(MarginConfig({}), commands.get_state, commands)
+        bare.log = lambda msg: None
+        self.assertEqual(bare.engine.mappings, {})      # 无输入行 → 不推送
+        self.assertEqual(bare.engine.outputs, [])       # 无输出行 → 不读数据
+        bare._clock = lambda: 100.0
+        bare._tick()
+        self.assertEqual(bare.engine.out_values, {})
+        self.assertEqual(commands.strength_calls, [])
 
     def test_module_class_attributes(self):
         module = MarginControlModule()
