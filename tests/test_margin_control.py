@@ -121,18 +121,20 @@ def _commands(pressure: float | None = None,
     return commands
 
 
-_TEST_OUTPUTS = [
-    {"param": "BMTR.Pressure", "name": "pressure",
-     "expr": "{BMTR.Pressure}", "type": "Float"},
-    {"param": "BMTR.EdgeState", "name": "edge",
-     "expr": "{BMTR.EdgeState}", "type": "Int"},
-]
-_TEST_PUSH = [{"name": "推送", "trigger": "period", "arg": 100,
-               "actions": [
-                   {"dir": "in", "param": "in_strength_a",
-                    "var": "stim_strength"},
-                   {"dir": "in", "param": "in_strength_b",
-                    "var": "stim_strength"}]}]
+_TEST_READ = {"name": "气压读取", "trigger": "period", "arg": 50,
+              "actions": [
+                  {"dir": "out", "param": "BMTR.Pressure", "var": "pressure"},
+                  {"dir": "out", "param": "BMTR.EdgeState", "var": "edge"}]}
+_TEST_PUSH = {"name": "强度推送", "trigger": "period", "arg": 50,
+              "actions": [
+                  {"dir": "in", "param": "in_strength_a",
+                   "var": "strength_out"},
+                  {"dir": "in", "param": "in_strength_b",
+                   "var": "strength_out"}]}
+_TEST_EVENTS = [_TEST_READ, _TEST_PUSH]
+_TEST_TEMPS = [{"name": "strength_out",
+                "expr": "max({stim_strength}, {punish_strength})"}]
+_CARD_STEP = 0.06
 
 
 def _bridge(config: dict | None = None, commands: FakeCommands | None = None,
@@ -140,10 +142,10 @@ def _bridge(config: dict | None = None, commands: FakeCommands | None = None,
     commands = commands or _commands()
     merged = dict(_FAST_JUDGE)
     merged.update(config or {})
-    if "outputs" not in merged:
-        merged["outputs"] = _TEST_OUTPUTS
-    if "mappings" not in merged and "events" not in merged:
-        merged["events"] = _TEST_PUSH
+    if "events" not in merged:
+        merged["events"] = _TEST_EVENTS
+    if "temps" not in merged:
+        merged["temps"] = _TEST_TEMPS
     bridge = MarginBridge(MarginConfig(merged), commands.get_state, commands)
     bridge.log = lambda msg: None
     bridge._clock = lambda: clock
@@ -153,7 +155,9 @@ def _bridge(config: dict | None = None, commands: FakeCommands | None = None,
 
 def _advance(bridge: MarginBridge, t: float) -> None:
     bridge._clock = lambda: t
+    bridge.engine.tick_event_cards(t - _CARD_STEP)
     bridge._tick()
+    bridge.engine.tick_event_cards(t)
 
 
 def _strength_by_channel(commands: FakeCommands) -> dict[str, int]:
@@ -310,7 +314,8 @@ class GuardSensorTests(unittest.TestCase):
 
 
     def test_adaptive_red_drops_after_edge_and_blue_follows(self):
-        guard = self._guard(adapt_drop_pct=10.0, adapt_blue_follow=30.0)
+        guard = self._guard(adapt_stim=True, adapt_drop_pct=10.0,
+                            adapt_blue_follow=30.0)
         guard.step(10.0, None, True, now=0.0)
         self.assertAlmostEqual(guard.red_threshold(), 17.0)
         self.assertAlmostEqual(guard.blue_threshold(), 15.0)
@@ -319,7 +324,8 @@ class GuardSensorTests(unittest.TestCase):
         self.assertAlmostEqual(guard.blue_threshold(), 14.55)
 
     def test_adaptive_red_timed_drop_when_no_edge(self):
-        guard = self._guard(adapt_drop_delay_s=10.0, adapt_drop_rate=10.0)
+        guard = self._guard(adapt_stim=True, adapt_drop_delay_s=10.0,
+                            adapt_drop_rate=10.0)
         guard.step(10.0, None, True, now=0.0)
         guard.step(10.0, None, True, now=5.0)
         self.assertAlmostEqual(guard.red_threshold(), 17.0)
@@ -327,7 +333,7 @@ class GuardSensorTests(unittest.TestCase):
         self.assertAlmostEqual(guard.red_threshold(), 15.5)
 
     def test_adaptive_blue_rises_when_cool_stuck(self):
-        guard = self._guard(adapt_blue_delay_s=10.0,
+        guard = self._guard(adapt_cool=True, adapt_blue_delay_s=10.0,
                             adapt_blue_rise_rate=10.0)
         guard.step(10.0, None, True, now=0.0)
         guard.step(45.0, None, True, now=1.0)
@@ -348,6 +354,19 @@ class GuardSensorTests(unittest.TestCase):
         guard2.step(45.0, None, True, now=1.0)
         guard2.step(45.0, None, True, now=3.0)
         self.assertAlmostEqual(guard2.blue_threshold(), 15.0)
+
+    def test_adaptation_switches_default_off(self):
+        guard = self._guard(adapt_drop_pct=10.0, adapt_drop_delay_s=0.0,
+                            adapt_drop_rate=10.0, adapt_blue_delay_s=0.0,
+                            adapt_blue_rise_rate=100.0)
+        self.assertFalse(guard._b("adapt_stim"))
+        self.assertFalse(guard._b("adapt_cool"))
+        guard.step(10.0, None, True, now=0.0)
+        guard.step(45.0, None, True, now=1.0)
+        self.assertAlmostEqual(guard.red_threshold(), 17.0)
+        self.assertAlmostEqual(guard.blue_threshold(), 15.0)
+        guard.step(15.5, None, True, now=20.0)
+        self.assertAlmostEqual(guard.blue_threshold(), 15.0)
 
 
     def test_cycle_limit_release_at_next_edge(self):
@@ -473,7 +492,8 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
 
 
     def test_red_timed_decay_is_linear_and_floored(self):
-        bridge, commands = _bridge({"adapt_drop_delay_s": 10.0,
+        bridge, commands = _bridge({"adapt_stim": True,
+                                    "adapt_drop_delay_s": 10.0,
                                     "adapt_drop_rate": 10.0,
                                     "smooth": 0.0},
                                    commands=_commands(pressure=10.0))
@@ -487,7 +507,8 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(red, bridge.guard.blue_threshold() + 0.5)
 
     def test_red_edge_drop_respects_floor(self):
-        bridge, commands = _bridge({"adapt_drop_pct": 90.0,
+        bridge, commands = _bridge({"adapt_stim": True,
+                                    "adapt_drop_pct": 90.0,
                                     "adapt_blue_follow": 0.0, "smooth": 0.0},
                                    commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
@@ -498,29 +519,32 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
                                 bridge.guard.blue_threshold() + 0.5)
 
 
-    def test_outputs_table_ingests_pressure(self):
+    def test_event_stream_ingests_pressure(self):
         commands = _commands(pressure=10.0)
         bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0}, commands)
         bridge.tick_at(100.0)
+        self.assertAlmostEqual(bridge.engine.temps["pressure"], 10.0)
+        self.assertIn("edge", bridge.engine.temps)
+        self.assertEqual(bridge.engine.outputs, [])
+        self.assertEqual(bridge.engine.mappings, {})
         self.assertAlmostEqual(bridge.engine.signals["pressure"], 10.0)
-        self.assertEqual(bridge.engine.mappings.get("pressure"), None)
-        self.assertIn("pressure", bridge.engine.out_values)
-        self.assertIn("edge", bridge.engine.out_values)
         commands.state.slots["s_bmt"].pressure = 45.0
         bridge.tick_at(110.0)
         self.assertEqual(bridge.guard.phase, PHASE_COOL)
 
-    def test_outputs_row_redirects_second_bmtr(self):
+    def test_out_action_redirects_second_bmtr(self):
         commands = _commands(pressure=10.0)
         commands.state.slots["s_bmt2"] = Slot(slot_id="s_bmt2", name="灵猫2",
                                               type="BMTR_1")
         commands.state.slots["s_bmt2"].pressure = 33.0
+        read2 = {"name": "气压读取2", "trigger": "period", "arg": 50,
+                 "actions": [{"dir": "out", "param": "BMTR.2.Pressure",
+                              "var": "pressure"}]}
         bridge, commands = _bridge(
-            {"ramp_s": 0.0, "smooth": 0.0,
-             "outputs": [{"param": "BMTR.2.Pressure", "name": "pressure",
-                          "expr": "{BMTR.2.Pressure}", "type": "Float"}]},
+            {"ramp_s": 0.0, "smooth": 0.0, "events": [read2, _TEST_PUSH]},
             commands)
         bridge.tick_at(100.0)
+        self.assertAlmostEqual(bridge.engine.temps["pressure"], 33.0)
         self.assertAlmostEqual(bridge.engine.signals["pressure"], 33.0)
 
     def test_frozen_pressure_failsafe(self):
@@ -540,25 +564,20 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         commands = _commands(pressure=10.0)
         commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
                                              type="OVC_1")
+        push = {"name": "双设备推送", "trigger": "period", "arg": 50,
+                "actions": [
+                    {"dir": "in", "param": "in_strength_a", "var": "punish"},
+                    {"dir": "in", "param": "in_ovc_strength_a",
+                     "var": "stim"}]}
         bridge, commands = _bridge(
             {"ramp_s": 0.0, "smooth": 0.0,
              "punish_strength": 100, "stim_strength": 60,
-             "events": [{"name": "帧事件流", "trigger": "period", "arg": 100,
-                         "actions": [
-                             {"dir": "in", "param": "in_strength_a",
-                              "var": "punish"},
-                             {"dir": "in", "param": "in_ovc_strength_a",
-                              "var": "stim"},
-                         ]}],
+             "events": [_TEST_READ, push],
              "temps": [{"name": "punish", "expr": "{punish_strength}"},
                        {"name": "stim", "expr": "{stim_strength}"}]},
             commands)
         bridge.tick_at(100.0)
-        self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
-                         "{punish}")
-        self.assertEqual(bridge.engine.mappings.get("in_ovc_strength_a"),
-                         "{stim}")
-        self.assertNotIn("in_strength_b", bridge.engine.mappings)
+        self.assertAlmostEqual(bridge.engine.temps["pressure"], 10.0)
         by_target = {(ch, sid): v for ch, v, sid in commands.strength_calls}
         self.assertEqual(by_target[("A", "s_ovc")], 60)
         commands.state.slots["s_bmt"].pressure = 45.0
@@ -569,15 +588,31 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(("B", "s_out"), by_target)
         self.assertNotIn(("B", "s_ovc"), by_target)
 
-    def test_user_mappings_override_events_chain(self):
-        bridge, _ = _bridge(
-            {"mappings": [{"param": "in_strength_a", "expr": "{on_edge}"}],
-             "events": [{"actions": [{"dir": "in",
-                                      "param": "in_strength_b",
-                                      "var": "punish"}]}]})
-        self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
-                         "{on_edge}")
-        self.assertNotIn("in_strength_b", bridge.engine.mappings)
+    def test_host_attach_temps_keeps_ingest(self):
+        shared = {"punish": 5.0}
+        bridge, commands = _bridge(
+            {"ramp_s": 0.0, "smooth": 0.0,
+             "temps": _TEST_TEMPS + [{"name": "seed", "value": 7.0}]},
+            commands=_commands(pressure=10.0))
+        bridge.engine.attach_temps(shared)
+        bridge.tick_at(100.0)
+        self.assertIs(bridge.engine.temps, shared)
+        self.assertAlmostEqual(shared["seed"], 7.0)
+        self.assertAlmostEqual(shared["punish"], 5.0)
+        self.assertAlmostEqual(shared["strength_out"], 60.0)
+        self.assertAlmostEqual(shared["pressure"], 10.0)
+        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
+
+    def test_ingest_card_and_push_card_are_independent(self):
+        read_only = {"name": "只读取", "trigger": "period", "arg": 50,
+                     "actions": [{"dir": "out", "param": "BMTR.Pressure",
+                                  "var": "pressure"}]}
+        bridge, commands = _bridge(
+            {"ramp_s": 0.0, "smooth": 0.0, "events": [read_only]},
+            commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)
+        self.assertAlmostEqual(bridge.engine.temps["pressure"], 10.0)
+        self.assertEqual(commands.strength_calls, [])
 
     def test_zero_noise_no_idle_flap(self):
         commands = _commands(pressure=0.0)
@@ -593,14 +628,11 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
             phases.append(bridge.guard.phase)
         self.assertNotIn(PHASE_STIM, phases)
 
-    def test_push_chain_rows_push_core_params(self):
+    def test_push_cards_dispatch_core_params(self):
         commands = _commands(pressure=10.0)
         bridge, commands = _bridge({"ramp_s": 0.0}, commands)
         bridge.tick_at(100.0)
-        self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
-                         "{stim_strength}")
-        self.assertEqual(bridge.engine.mappings.get("in_strength_b"),
-                         "{stim_strength}")
+        self.assertTrue(bridge.engine.has_events())
         dispatched = {(ch, sid) for ch, _v, sid in commands.strength_calls}
         self.assertIn(("A", "s_out"), dispatched)
         self.assertIn(("B", "s_out"), dispatched)
@@ -659,18 +691,18 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.engine.signals["punish_strength"], 0)
         self.assertEqual(_strength_by_channel(commands), {"A": 90, "B": 90})
 
-    def test_crossing_drives_punish_through_mapping(self):
+    def test_crossing_drives_punish_through_cards(self):
+        push = {"name": "推送", "trigger": "period", "arg": 50,
+                "actions": [
+                    {"dir": "in", "param": "in_strength_a", "var": "out"},
+                    {"dir": "in", "param": "in_strength_b", "var": "out"}]}
         bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
                                     "punish_strength": 120,
                                     "punish_s": 1.0,
                                     "temps": [{"name": "out",
                                                "expr": "max({stim_strength},"
                                                        " {punish_strength})"}],
-                                    "events": [
-                   {"name": "推送", "trigger": "period", "arg": 100,
-                    "actions": [
-                        {"dir": "in", "param": "in_strength_a", "var": "out"},
-                        {"dir": "in", "param": "in_strength_b", "var": "out"}]}]},
+                                    "events": [_TEST_READ, push]},
                                    commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
         self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
@@ -698,7 +730,7 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.engine.signals["stim_strength"], 0)
         self.assertEqual(commands.strength_calls, [])
 
-    def test_pause_zeroes_outputs_via_mapping(self):
+    def test_pause_zeroes_outputs_via_cards(self):
         bridge, commands = _bridge({"ramp_s": 0.0},
                                    commands=_commands(pressure=10.0))
         bridge.tick_at(100.0)
@@ -726,7 +758,7 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(commands.fire_calls, [])
         self.assertEqual(commands.reset_calls, [])
 
-    async def test_stop_zeroes_via_mapping_only(self):
+    async def test_stop_zeroes_via_cards(self):
         bridge, commands = _bridge({"ramp_s": 0.0},
                                    commands=_commands(pressure=10.0))
         await bridge.start()
@@ -745,17 +777,31 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(commands.strength_calls, [])
         self.assertEqual(commands.reset_calls, [])
 
-    async def test_reload_config_hot_swaps_mappings(self):
-        bridge, _ = _bridge()
-        self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
-                         "{stim_strength}")
-        bridge.config["mappings"] = [
-            {"param": "in_strength_a", "expr": "{punish_strength}"},
-        ]
+    async def test_reload_config_hot_swaps_event_cards(self):
+        read_only = {"name": "只读取", "trigger": "period", "arg": 50,
+                     "actions": [{"dir": "out", "param": "BMTR.Pressure",
+                                  "var": "pressure"}]}
+        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
+                                    "events": [_TEST_READ, _TEST_PUSH]},
+                                   commands=_commands(pressure=10.0))
+        bridge.tick_at(100.0)
+        self.assertIn(("A", "s_out"),
+                      {(ch, sid) for ch, _v, sid in commands.strength_calls})
+        self.assertIn(("B", "s_out"),
+                      {(ch, sid) for ch, _v, sid in commands.strength_calls})
+        bridge.config["events"] = [read_only,
+                                   {"name": "单通道推送", "trigger": "period",
+                                    "arg": 50,
+                                    "actions": [{"dir": "in",
+                                                 "param": "in_strength_a",
+                                                 "var": "strength_out"}]}]
         await bridge.reload_config()
-        self.assertEqual(bridge.engine.mappings.get("in_strength_a"),
-                         "{punish_strength}")
-        self.assertNotIn("in_strength_b", bridge.engine.mappings)
+        commands.strength_calls.clear()
+        commands.state.slots["s_bmt"].pressure = 45.0
+        bridge.tick_at(110.0)
+        dispatched = {(ch, sid) for ch, _v, sid in commands.strength_calls}
+        self.assertEqual(dispatched, {("A", "s_out")})
+        self.assertEqual(_strength_by_channel(commands), {"A": 100})
 
 
 class PluginContractTests(unittest.TestCase):
@@ -777,7 +823,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.11.0")
+        self.assertEqual(meta["version"], "0.12.0")
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
                          {"pressure", "edge", "stim_strength",
@@ -795,18 +841,26 @@ class PluginContractTests(unittest.TestCase):
                     "adapt_drop_rate", "adapt_blue_follow", "adapt_cool",
                     "adapt_blue_delay_s", "adapt_blue_rise_rate",
                     "leak_comp",
-                    "mappings"):
+                    "events", "temps"):
             self.assertIn(key, cfg)
+        self.assertNotIn("mappings", cfg)
+        self.assertNotIn("outputs", cfg)
+        self.assertNotIn("reads", meta)
+        self.assertEqual([t["key"] for t in meta["temps"]],
+                         ["pressure", "edge"])
         self.assertNotIn("phase", cfg)
         self.assertNotIn("pressure_pct", cfg)
         self.assertNotIn("deny_zap_s", cfg)
         self.assertNotIn("release_fire_s", cfg)
-        self.assertEqual(cfg["mappings"].get("rows"), "in")
         self.assertEqual(cfg["mode"].get("choices"),
                          ["sensor", "app", "off"])
         self.assertEqual(cfg["edge_threshold"].get("group"), "judge")
         self.assertEqual(cfg["cycle_limit"].get("group"), "release")
         self.assertEqual(cfg["adapt_drop_pct"].get("group"), "adapt")
+        self.assertIs(cfg["adapt_stim"].get("default"), False)
+        self.assertIs(cfg["adapt_cool"].get("default"), False)
+        self.assertIs(MARGIN_CONFIG_DEFAULTS["adapt_stim"], False)
+        self.assertIs(MARGIN_CONFIG_DEFAULTS["adapt_cool"], False)
         self.assertEqual(meta["actions"],
                          ["margin_reset_pressure", "margin_guard_toggle"])
 
@@ -842,8 +896,10 @@ class PluginContractTests(unittest.TestCase):
         bare.log = lambda msg: None
         self.assertEqual(bare.engine.mappings, {})
         self.assertEqual(bare.engine.outputs, [])
+        self.assertFalse(bare.engine.has_events())
         bare._clock = lambda: 100.0
         bare._tick()
+        self.assertEqual(bare.engine.temps, {})
         self.assertEqual(bare.engine.out_values, {})
         self.assertEqual(commands.strength_calls, [])
 
@@ -860,7 +916,7 @@ class PluginContractTests(unittest.TestCase):
             "log": staticmethod(lambda msg: None),
             "submit": staticmethod(lambda coro: None),
             "engine": None,
-            "settings": {"outputs": []},
+            "settings": {},
         })())
         module._press_guard_toggle(None, None)
         module.on_unload()

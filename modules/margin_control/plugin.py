@@ -2,11 +2,12 @@
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.11.0",
-    "description": "灵猫气压 / 官方边控会话 → 闭环边控（纯数值推送）："
-                   "数值只经映射表流动（输出表读气压、输入表/推送链推"
-                   "强度，零内置兜底行）；达限后的下一次到边即释放边"
-                   "（不惩罚、刺激器=助力、循环置零）。",
+    "version": "0.12.0",
+    "description": "灵猫气压 / 官方边控会话 → 闭环边控（事件流数据面）："
+                   "事件流「输出」动作把 BMTR.Pressure/EdgeState 推入模块"
+                   "变量，闭环判定后经「输入」动作推送强度，零内置兜底链路；"
+                   "达限后的下一次到边即释放边（不惩罚、刺激器=助力、循环"
+                   "置零）。",
     "settings_key": "margin_control",
     "default_enabled": False,
     "actions": ["margin_reset_pressure", "margin_guard_toggle"],
@@ -26,11 +27,14 @@ META = {
         "cycles": {"label": "边控循环", "desc": "当前轮「到边→冷静」计数；释放完成"
                                               "后清零重新计"},
     },
-    "reads": {
-        "Pressure": {"label": "气压 (kPa)", "name": "pressure",
-                     "type": "Float"},
-        "EdgeState": {"label": "官方边控状态", "name": "edge", "type": "Int"},
-    },
+    "temps": [
+        {"key": "pressure", "label": "灵猫气压读数",
+         "desc": "事件流「输出」动作 BMTR.Pressure → pressure 写入的原始"
+                 "气压 (kPa)，闭环判定与平滑以此为输入"},
+        {"key": "edge", "label": "官方边控状态读数",
+         "desc": "事件流「输出」动作 BMTR.EdgeState → edge 写入的会话状态 "
+                 "0-4（app 模式输入）"},
+    ],
     "config": {
         "mode": {
             "label": "边控模式", "type": "choice",
@@ -38,7 +42,7 @@ META = {
             "group": "basic",
             "desc": "sensor=按气压判定自动边控（不依赖 App）；"
                     "app=跟随官方 App 边控会话（Socket V4，状态 0-4）；"
-                    "off=不闭环，仅提供映射变量",
+                    "off=不闭环，仅提供变量数值",
         },
         "smooth": {
             "label": "气压平滑", "type": "float",
@@ -122,7 +126,7 @@ META = {
             "label": "刺激强度", "type": "int",
             "default": 60, "min": 0, "max": 200,
             "group": "strength",
-            "desc": "刺激期目标强度，经映射变量 {stim_strength} 落地"
+            "desc": "刺激期目标强度，经变量 {stim_strength} 落地"
                     "（波形/上限请在官方 App 或控制页调好）",
         },
         "cool_strength": {
@@ -135,7 +139,7 @@ META = {
             "label": "助力强度", "type": "int",
             "default": 80, "min": 0, "max": 200,
             "group": "strength",
-            "desc": "释放期（允许高潮）输出强度；与刺激强度共用映射变量 "
+            "desc": "释放期（允许高潮）输出强度；与刺激强度共用变量 "
                     "{stim_strength} 输出",
         },
         "ramp_s": {
@@ -148,7 +152,7 @@ META = {
             "label": "惩罚器强度", "type": "int",
             "default": 100, "min": 0, "max": 200,
             "group": "strength",
-            "desc": "判定到边的瞬间以该强度输出（经映射变量 "
+            "desc": "判定到边的瞬间以该强度输出（经变量 "
                     "{punish_strength}），0=关闭惩罚",
         },
         "punish_s": {
@@ -159,7 +163,7 @@ META = {
         },
         "adapt_stim": {
             "label": "刺激阶段红线自适应", "type": "bool",
-            "default": True,
+            "default": False,
             "group": "adapt",
             "desc": "刺激阶段按下列规则下调红线（更容易判到边）",
         },
@@ -189,7 +193,7 @@ META = {
         },
         "adapt_cool": {
             "label": "冷静阶段蓝线自适应", "type": "bool",
-            "default": True,
+            "default": False,
             "group": "adapt",
             "desc": "冷静阶段超时未恢复时上调蓝线（恢复变容易）",
         },
@@ -213,39 +217,23 @@ META = {
             "desc": "叠加到气压读数上的固定补偿（腔体漏气读数偏低时调大；"
                     "官方默认 3）",
         },
-        "mappings": {
-            "label": "输入映射表（模块 → 核心）", "type": "list",
-            "default": [], "group": "map", "rows": "in",
-            "desc": "行 {param: 核心输入参数, expr: 表达式}，表达式以 "
-                    "{stim_strength} {punish_strength} {pressure} "
-                    "{on_release} 等引用模块变量，结果取整钳制后派发；"
-                    "目标设备/通道由参数 id 决定（in_* 郊狼、in_ovc_* 负鼠、"
-                    "in_fire 开火…）。表留空用默认行（郊狼 A/B ← max(刺激, "
-                    "惩罚)）",
-        },
-        "outputs": {
-            "label": "输出映射表（核心 → 模块）", "type": "list",
-            "default": [], "group": "map", "rows": "out",
-            "desc": "行 {param: 核心输出信号, name: 模块读入变量名, expr, "
-                    "type}，求值结果作为模块输入（pressure/edge）。表留空"
-                    "全空 = 不读任何设备数据（模块零内置兜底行，链路只"
-                    "来自配置；装载时空表会按「可读参数」补默认行）",
-        },
         "events": {
-            "label": "推送链（param ← var）", "type": "list",
+            "label": "事件流卡片", "type": "list",
             "default": [], "group": "map",
-            "desc": "行 {name, trigger, arg, actions: [{dir: \"in\", "
-                    "param: 核心输入参数, var: 变量名}]}：把变量数值连续"
-                    "推送到核心参数（纯数值推送）。显式 mappings 行优先于"
-                    "本链；无 mappings 且无本链时用默认行（郊狼 A/B ← "
-                    "max(刺激, 惩罚)）",
+            "desc": "卡片 {name, trigger, arg, actions: [{dir, param, "
+                    "var}]}：「输出」动作把核心输出信号读入模块变量"
+                    "（BMTR.Pressure → pressure、BMTR.EdgeState → edge），"
+                    "「输入」动作把 {stim_strength} {punish_strength} 等变量"
+                    "值推送到核心输入参数（in_* 郊狼、in_ovc_* 负鼠）。"
+                    "动作内不做运算，组合（如 max(刺激, 惩罚)）写在临时变量",
         },
         "temps": {
-            "label": "派生变量", "type": "list", "default": [],
+            "label": "临时变量", "type": "list", "default": [],
             "group": "map",
-            "desc": "行 {name, expr}（每拍对模块变量求值，如 punish ← "
-                    "{punish_strength}）或 {name, value}（静态初值）；"
-                    "结果作为模块变量供推送链/映射表引用",
+            "desc": "行 {name, expr} 每次映射重算按序求值（如 strength_out "
+                    "← max({stim_strength}, {punish_strength})，供「输入」"
+                    "动作引用），{name, value} 为静态初值；pressure/edge 由"
+                    "模块声明并维护，事件流「输出」动作写入",
         },
     },
 }
@@ -257,37 +245,6 @@ from modules.margin_control.bridge import (PARAM_DEFS, MarginBridge,
                                            MarginConfig)
 
 MARGIN_CONFIG_DEFAULTS = spec_defaults(META["config"])
-
-
-def _signal_spec(signal: str) -> dict | None:
-    from dglab.params import output_specs
-
-    for family in ("COYOTE", "OVC", "BMTR"):
-        for spec in output_specs(family, 1):
-            if spec["signal"] == signal:
-                return spec
-    return None
-
-
-def materialize_reads(settings: dict) -> bool:
-    if any(isinstance(row, dict) and str(row.get("name") or "").strip()
-           for row in (settings.get("outputs") or [])):
-        return False
-    rows = []
-    for signal, item in META["reads"].items():
-        spec = _signal_spec(signal)
-        if spec is None:
-            continue
-        rows.append({"param": spec["key"],
-                     "name": str(item.get("name") or signal),
-                     "expr": "{" + spec["key"] + "}",
-                     "type": str(spec.get("type") or "Int")})
-    if not rows:
-        return False
-    settings["outputs"] = rows
-    if hasattr(settings, "save"):
-        settings.save()
-    return True
 
 
 class MarginControlModule(ModuleBase):
@@ -308,13 +265,8 @@ class MarginControlModule(ModuleBase):
         return [(name, str(item.get("label") or ""))
                 for name, item in PARAM_DEFS.items()]
 
-    def read_params(self) -> list[tuple[str, str]]:
-        return [(f"BMTR.{signal}", str(item.get("label") or signal))
-                for signal, item in META["reads"].items()]
-
     def on_load(self, ctx) -> None:
         self.ctx = ctx
-        materialize_reads(self.ctx.settings)
 
     def on_unload(self) -> None:
         if self.bridge is not None:

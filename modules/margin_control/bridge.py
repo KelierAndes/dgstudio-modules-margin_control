@@ -6,8 +6,7 @@ import time
 import traceback
 from typing import Any, Callable
 
-from dglab import expr as _expr
-from dglab.mapping import MappingEngine
+from dglab.mapping import MappingEngine, event_cards
 from dglab.params import (build_dispatchers, core_alias_values, core_inputs,
                           device_state_values, input_ranges)
 from dglab.state import family_of
@@ -68,17 +67,15 @@ class MarginConfig(dict):
         "ramp_s": 3.0,
         "punish_strength": 100,
         "punish_s": 1.0,
-        "adapt_stim": True,
+        "adapt_stim": False,
         "adapt_drop_pct": 0.0,
         "adapt_drop_delay_s": 100.0,
         "adapt_drop_rate": 1.0,
         "adapt_blue_follow": 30.0,
-        "adapt_cool": True,
+        "adapt_cool": False,
         "adapt_blue_rise_rate": 0.5,
         "adapt_blue_delay_s": 100.0,
         "leak_comp": 0.0,
-        "mappings": [],
-        "outputs": [],
     }
 
     def __init__(self, data: dict | None = None, defaults: dict | None = None):
@@ -150,7 +147,7 @@ class EdgeGuard:
             self.blue_shift -= amount * follow / 100.0
 
     def _adapt_on_edge(self, now: float) -> None:
-        if not self._b("adapt_stim", True):
+        if not self._b("adapt_stim", False):
             return
         pct = self._f("adapt_drop_pct")
         if pct > 0:
@@ -159,13 +156,13 @@ class EdgeGuard:
     def _adapt_step(self, now: float, dt: float) -> None:
         if dt <= 0:
             return
-        if self.phase == PHASE_STIM and self._b("adapt_stim", True):
+        if self.phase == PHASE_STIM and self._b("adapt_stim", False):
             delay = self._f("adapt_drop_delay_s")
             rate = self._f("adapt_drop_rate")
             if rate > 0 and (now - self.phase_since) >= delay:
                 self._drop_red(self._f("edge_threshold", 17.0)
                                * rate / 100.0 * dt)
-        elif self.phase == PHASE_COOL and self._b("adapt_cool", True):
+        elif self.phase == PHASE_COOL and self._b("adapt_cool", False):
             delay = self._f("adapt_blue_delay_s")
             rate = self._f("adapt_blue_rise_rate")
             if rate > 0 and (now - self.phase_since) >= delay:
@@ -346,22 +343,20 @@ class MarginBridge:
         self.engine = MappingEngine(self._dispatch,
                                     device_vars=self._device_vars,
                                     ranges=input_ranges())
+        self.engine.armed = False
         self._api = self._DeviceApi(self)
         self.dispatchers = build_dispatchers(self._api, core_inputs())
-        self._primed = False
         self.apply_config()
 
 
     def apply_config(self) -> None:
-        first = not self._primed
-        if first:
-            self.engine.armed = False
-        self.engine.set_mappings(self._effective_rows())
-        self.engine.set_outputs(self._effective_output_rows())
         self._seed_temps()
-        if first:
-            self.engine.armed = True
-            self._primed = True
+        self.engine.set_temp_rows(self.config.get("temps") or [])
+        rows = self.config.get("events") or []
+        self.engine.set_event_cards(rows)
+        self._push_cards = [card for card in event_cards(rows)
+                            if any(act["dir"] == "in"
+                                   for act in card["actions"])]
 
     def _seed_temps(self) -> None:
         for temp in self.config.get("temps") or []:
@@ -374,51 +369,7 @@ class MarginBridge:
                 value = float(temp.get("value") or 0.0)
             except (TypeError, ValueError):
                 value = 0.0
-            self.engine.signals.setdefault(name, value)
-
-    def _rows_of(self, key: str) -> list[dict[str, str]]:
-        return [row for row in (self.config.get(key) or [])
-                if isinstance(row, dict)
-                and str(row.get("param") or "").strip()]
-
-    def _rows_from_events(self) -> list[dict[str, str]]:
-        out: list[dict[str, str]] = []
-        for event in self.config.get("events") or []:
-            if not isinstance(event, dict):
-                continue
-            for action in event.get("actions") or []:
-                if not isinstance(action, dict):
-                    continue
-                if str(action.get("dir") or "in") != "in":
-                    continue
-                param = str(action.get("param") or "").strip()
-                var = str(action.get("var") or "").strip()
-                if param and var:
-                    out.append({"param": param, "expr": "{" + var + "}"})
-        return out
-
-    def _effective_rows(self) -> list[dict]:
-        user = self._rows_of("mappings")
-        if user:
-            return user
-        return self._rows_from_events()
-
-    def _effective_output_rows(self) -> list[dict]:
-        return self._rows_of("outputs")
-
-    def _publish_temps(self) -> None:
-        for temp in self.config.get("temps") or []:
-            if not isinstance(temp, dict):
-                continue
-            name = str(temp.get("name") or "").strip()
-            expr = temp.get("expr")
-            if not name or not isinstance(expr, str) or not expr.strip():
-                continue
-            try:
-                value = float(_expr.evaluate(expr, self.engine.signals))
-            except _expr.ExprError:
-                continue
-            self.engine.signal(name, value)
+            self.engine.temps.setdefault(name, value)
 
     def _safe_state(self):
         try:
@@ -438,7 +389,7 @@ class MarginBridge:
         try:
             runner(value)
         except Exception as exc:
-            self.log(f"映射派发 {target}={value} 失败: {exc!r}")
+            self.log(f"事件流派发 {target}={value} 失败: {exc!r}")
 
     class _DeviceApi:
 
@@ -513,8 +464,16 @@ class MarginBridge:
         self.guard.reset(self._clock())
         self.engine.signal("stim_strength", 0)
         self.engine.signal("punish_strength", 0)
+        self._fire_push_cards()
         self._refresh_last_values()
         self.log("灵猫边控联动已停止")
+
+    def _fire_push_cards(self) -> None:
+        for card in self._push_cards:
+            try:
+                self.engine.fire_card(card)
+            except Exception as exc:
+                self.log(f"停止归零推送失败: {exc!r}")
 
     def close(self) -> None:
         self._running = False
@@ -527,7 +486,7 @@ class MarginBridge:
 
     def toggle_pause(self) -> bool:
         self.paused = not self.paused
-        self.log("边控闭环已暂停（输出经映射表归零）" if self.paused
+        self.log("边控闭环已暂停（输出经事件流归零）" if self.paused
                  else "边控闭环已恢复")
         return self.paused
 
@@ -546,8 +505,8 @@ class MarginBridge:
     def _tick(self) -> None:
         cfg = self.config
         self.engine.pump()
-        raw = self.engine.out_values.get("pressure")
-        edge = self.engine.out_values.get("edge")
+        raw = self.engine.temps.get("pressure")
+        edge = self.engine.temps.get("edge")
         now = self._clock()
 
         timeout = max(1.0, self._cfg_f(cfg, "sensor_timeout_s", 5.0))
@@ -586,7 +545,7 @@ class MarginBridge:
         self.engine.signal("on_release",
                            1 if self.guard.phase == PHASE_RELEASE else 0)
         self.engine.signal("cycles", self.guard.cycles)
-        self._publish_temps()
+        self.engine.armed = True
         self._refresh_last_values()
 
     def _refresh_last_values(self) -> None:
@@ -620,7 +579,7 @@ class MarginBridge:
         self._last_offline_log = now
         if self._last_pressure_seen is None:
             self.log("尚未读到有效气压（>0 kPa；确认灵猫已连接，"
-                     "或检查输出映射表的 BMTR.Pressure 行）；闭环待机中")
+                     "事件流已把 BMTR.Pressure 写入 pressure 变量）；闭环待机中")
         else:
             self.log("灵猫气压无有效读数（归零/失联/读数冻结），"
                      "闭环归零待机中")

@@ -7,7 +7,8 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-CORE_NAMES = ("DG-LAB-X-VRChat-OSC", "DG-LAB-X-VRChat-OSC-development",
+CORE_NAMES = ("DG-Lab-Studio", "DG-LAB-X-VRChat-OSC",
+              "DG-LAB-X-VRChat-OSC-development",
               "DGStudio", "DGStudio-Core")
 
 
