@@ -1,40 +1,3 @@
-"""灵猫边控桥接：纯数值推送的双向映射管道（核心 ⇄ 模块）。
-
-**模块不做任何设备管理**——全部数值经两张映射表流动：
-
-* 核心 → 模块（**输出映射表**）：默认行 ``BMTR.Pressure → pressure``、
-  ``BMTR.EdgeState → edge``，从核心输出信号空间读入传感值
-  （换绑其它灵猫 = 改输出表行，如 ``BMTR.2.Pressure``）；
-* 模块 → 核心（**输入映射表**）：模块发布命名数值（``stim_strength`` /
-  ``punish_strength`` …），默认行 ``in_strength_a/b ←
-  max({stim_strength}, {punish_strength})``——目标设备/通道完全由核心
-  输入参数 id 决定（``in_*`` 郊狼、``in_ovc_*`` 负鼠），派发只按核心
-  输入路由定位（各类型首台，跳过灵猫）。
-
-数据流：输出表求值 ``out_values`` → 指数平滑 + 漏气补偿 →
-:class:`EdgeGuard` 闭环状态机（每 0.1s 一拍，判定条件与阈值自适应对标
-DG-Lab 官方边控玩法设置页）→ 映射变量喂回模块映射引擎 → **输入映射表**
-求值派发。
-
-sensor 模式判定条件（对标官方「判定条件」页）：
-
-* 红线（边缘气压阈值）：气压高于红线判即将高潮；可要求**持续高于** N 秒；
-* 气压跳变：短窗口内上升速率达 N kPa/s 也判即将高潮（官方「气压短时间
-  上升差值」）；
-* 蓝线（恢复气压阈值）：冷静期满最小冷静时间且气压低于蓝线判恢复；
-  可要求**持续低于** N 秒；
-* 阈值自适应（官方「阈值自适应调整」）：刺激阶段每次成功边控后红线按
-  百分比下降、超时未到边红线缓慢下降（线性、有下限），蓝线按比例跟随；
-  冷静阶段超时未恢复蓝线缓慢上升（恢复变容易）；红线/蓝线间保持安全间隙。
-
-释放触发（满足其一即进释放期，助力强度经刺激器变量输出）：
-
-* 边控次数：指定边控循环轮数后（官方「固定模式」）；
-* 持续时长：游戏进行指定时长后（官方「游戏进行指定时长后，允许高潮释放」）；
-* app 模式：跟随官方会话状态 4（允许高潮），次数/时长不介入。
-
-``off`` 模式不闭环，仅提供映射变量。
-"""
 
 from __future__ import annotations
 
@@ -53,17 +16,11 @@ __all__ = ["MarginBridge", "MarginConfig", "EdgeGuard", "PARAM_DEFS",
            "PHASE_IDLE", "PHASE_STIM", "PHASE_COOL", "PHASE_RELEASE",
            "PHASE_LABELS"]
 
-# 闭环节拍：0.1s 一拍（与核心脉冲帧 / 音频联动的节奏一致）
 TICK_S = 0.1
-# 有效读数阈值 (kPa)：平滑 + 漏气补偿后的有效气压须高于此值（静息清零后
-# 读数在 0 附近抖动，ε 消除待机/刺激抖动）
 FRESH_EPSILON = 0.05
-# 单拍最大按秒推进量：暂停/失联恢复后自适应不瞬移
 MAX_STEP_DT = 5.0
-# 红蓝线安全间隙 (kPa)：蓝线永不超过红线 - GAP
 THRESHOLD_GAP = 0.5
 
-# 闭环阶段（内部状态；对外经 on_release 等变量表达）
 PHASE_IDLE = 0
 PHASE_STIM = 1
 PHASE_COOL = 2
@@ -71,8 +28,6 @@ PHASE_RELEASE = 3
 PHASE_LABELS = {PHASE_IDLE: "待机", PHASE_STIM: "刺激",
                 PHASE_COOL: "冷静", PHASE_RELEASE: "释放"}
 
-# 七个映射变量（META["params"] 的唯一来源，模块页实时数据区据此展示）；
-# 全部设备输出经输入映射表引用这些变量落地，状态机不直接控制设备
 PARAM_DEFS: dict[str, dict[str, str]] = {
     "pressure": {"label": "灵猫气压", "desc": "平滑 + 漏气补偿后气压 (kPa)"},
     "edge": {"label": "官方边控状态", "desc": "App 边控会话 0-4：0 停止 / "
@@ -92,13 +47,11 @@ PARAM_DEFS: dict[str, dict[str, str]] = {
 
 
 class MarginConfig(dict):
-    """边控模块配置：缺省值优先取模块声明（defaults 参数），DEFAULTS 为兜底。"""
 
     DEFAULTS = {
         "mode": "sensor",
         "smooth": 0.5,
         "sensor_timeout_s": 5.0,
-        # 判定条件
         "edge_threshold": 17.0,
         "recovery_threshold": 15.0,
         "edge_hold_s": 0.0,
@@ -106,18 +59,15 @@ class MarginConfig(dict):
         "jump_window_s": 2.0,
         "cooldown_s": 10.0,
         "recovery_hold_s": 5.0,
-        # 释放
         "cycle_limit": 5,
         "time_release_s": 0.0,
         "release_s": 15.0,
-        # 强度
         "stim_strength": 60,
         "cool_strength": 0,
         "assist_strength": 80,
         "ramp_s": 3.0,
         "punish_strength": 100,
         "punish_s": 1.0,
-        # 阈值自适应
         "adapt_stim": True,
         "adapt_drop_pct": 0.0,
         "adapt_drop_delay_s": 100.0,
@@ -127,7 +77,6 @@ class MarginConfig(dict):
         "adapt_blue_rise_rate": 0.5,
         "adapt_blue_delay_s": 100.0,
         "leak_comp": 0.0,
-        # 映射表（输入 = 模块→核心推送，输出 = 核心→模块读数）
         "mappings": [],
         "outputs": [],
     }
@@ -139,42 +88,22 @@ class MarginConfig(dict):
             self.update({k: v for k, v in data.items() if v is not None})
 
 
-# ---------------------------------------------------------------- 闭环状态机
-
 class EdgeGuard:
-    """边控闭环状态机（纯逻辑，不碰 asyncio / 引擎，便于单测）。
-
-    判定条件与阈值自适应对标 DG-Lab 官方边控玩法设置页；状态机**不产生
-    任何设备命令**：每拍经 :meth:`outputs` 给出两路强度（刺激器 / 惩罚器），
-    由桥接器喂进映射表落地。
-
-    :param config: 模块配置（与 MarginBridge 共享同一字典，改键即热生效）
-    :attr phase: 当前阶段（PHASE_*，内部状态；对外经 on_release 等表达）
-    :attr cycles: 当前轮「到边→冷静」计数（映射变量 ``cycles``）
-    :attr red_drop / blue_shift: 阈值自适应累计量 (kPa)
-
-    :meth:`step` 每拍调用推进状态转移；:meth:`outputs` 返回本拍两路输出
-    ``(刺激器, 惩罚器)``；:meth:`red_threshold` / :meth:`blue_threshold`
-    返回自适应后的当前红线/蓝线。
-    """
 
     def __init__(self, config: dict):
         self.config = config
         self.phase = PHASE_IDLE
         self.phase_since = 0.0
         self.cycles = 0
-        self.punish_until = 0.0          # 惩罚窗口截止时刻（monotonic）
-        self.session_since: float | None = None   # 会话开始（首次进刺激）
-        # 阈值自适应累计量：红线下降量（≥0）、蓝线偏移（负=跟随下降，正=上升）
+        self.punish_until = 0.0
+        self.session_since: float | None = None
         self.red_drop = 0.0
         self.blue_shift = 0.0
-        # 判定辅助状态
-        self._above_since: float | None = None    # 持续高于红线起点
-        self._below_since: float | None = None    # 持续低于蓝线起点
-        self._history: list[tuple[float, float]] = []   # 跳变窗口 (now, p)
+        self._above_since: float | None = None
+        self._below_since: float | None = None
+        self._history: list[tuple[float, float]] = []
         self._last_now: float | None = None
 
-    # ---- 配置快捷读取（每拍读，改配置即热生效） -------------------------
 
     def _mode(self) -> str:
         return str(self.config.get("mode") or "sensor")
@@ -196,28 +125,19 @@ class EdgeGuard:
         return bool(value) if not isinstance(value, str) \
             else value.lower() in ("1", "true", "yes", "on")
 
-    # ---- 自适应阈值 -----------------------------------------------------
 
     def red_floor(self) -> float:
-        """红线下限：恢复阈值 + 安全间隙——自适应无论怎么累计，红线永不
-        跌入蓝线回差带（到边判定永不低于恢复阈值 + 0.5 kPa）。"""
         return max(1.0, self._f("recovery_threshold", 15.0) + THRESHOLD_GAP)
 
     def red_threshold(self) -> float:
-        """当前红线（边缘阈值）：配置值 − 自适应累计下降量，不低于
-        :meth:`red_floor`。"""
         return max(self.red_floor(),
                    self._f("edge_threshold", 17.0) - self.red_drop)
 
     def blue_threshold(self) -> float:
-        """当前蓝线（恢复阈值）：配置值 + 自适应偏移，恒低于红线至少
-        :data:`THRESHOLD_GAP`。"""
         blue = self._f("recovery_threshold", 15.0) + self.blue_shift
         return min(max(0.0, blue), self.red_threshold() - THRESHOLD_GAP)
 
     def _drop_red(self, amount: float) -> None:
-        """红线下降 amount kPa（超过下限的部分不累计，避免回差带坍缩），
-        蓝线按「跟随下降百分比」同步下探。"""
         if amount <= 0:
             return
         room = max(0.0, self.red_threshold() - self.red_floor())
@@ -230,7 +150,6 @@ class EdgeGuard:
             self.blue_shift -= amount * follow / 100.0
 
     def _adapt_on_edge(self, now: float) -> None:
-        """成功边控瞬间的红线自适应：按百分比立即下降。"""
         if not self._b("adapt_stim", True):
             return
         pct = self._f("adapt_drop_pct")
@@ -238,9 +157,6 @@ class EdgeGuard:
             self._drop_red(self.red_threshold() * pct / 100.0)
 
     def _adapt_step(self, now: float, dt: float) -> None:
-        """逐拍自适应：刺激阶段超时未到边红线缓慢下降（**线性**：按配置
-        基线计算降幅，不随当前红线复利衰减）；冷静阶段超时未恢复蓝线
-        缓慢上升（恢复变容易）。"""
         if dt <= 0:
             return
         if self.phase == PHASE_STIM and self._b("adapt_stim", True):
@@ -256,7 +172,6 @@ class EdgeGuard:
                 self.blue_shift += self.blue_threshold() * rate / 100.0 * dt
 
     def _rise_rate(self, now: float) -> float:
-        """跳变窗口内的气压上升速率 (kPa/s)；样本不足返回 0。"""
         window = max(0.2, self._f("jump_window_s", 2.0))
         while self._history and now - self._history[0][0] > window:
             self._history.pop(0)
@@ -268,10 +183,8 @@ class EdgeGuard:
             return 0.0
         return (self._history[-1][1] - p0) / span
 
-    # ---- 状态转移 -------------------------------------------------------
 
     def reset(self, now: float = 0.0) -> None:
-        """归位待机（两路输出 0），保留会话时长与自适应累计。"""
         self.phase = PHASE_IDLE
         self.phase_since = now
         self.punish_until = 0.0
@@ -280,10 +193,6 @@ class EdgeGuard:
         self._history.clear()
 
     def _enter(self, phase: int, now: float) -> None:
-        """进入阶段：重复进入无动作；进冷静记一次循环、开惩罚窗口并做
-        边控后红线自适应（释放边不进冷静，因此无惩罚）；首次进刺激记
-        会话开始（持续时长释放的计时起点）；离开释放期同样清零循环
-        （app 模式会话轮换）。"""
         if phase == self.phase:
             return
         leaving_release = self.phase == PHASE_RELEASE
@@ -305,7 +214,6 @@ class EdgeGuard:
             self.session_since = now
 
     def _stim_target(self, now: float) -> int:
-        """刺激器目标：刺激期按 ``ramp_s`` 从 0 缓升到刺激强度。"""
         stim = max(0, self._i("stim_strength", 60))
         ramp = self._f("ramp_s")
         if ramp <= 0:
@@ -314,14 +222,6 @@ class EdgeGuard:
         return int(round(stim * t))
 
     def outputs(self, now: float) -> tuple[int, int]:
-        """本拍两路输出 ``(刺激器, 惩罚器)``：
-
-        * 刺激期 → 刺激强度（爬升中）；冷静期 → 冷静强度；释放期 →
-          助力强度（立即满量不爬升）——刺激/助力共用刺激器这一个映射
-          变量输出；待机 0。
-        * 惩罚器：冷静期惩罚窗口内 → 惩罚器强度（映射行取最大值即惩罚
-          优先），其余 0。
-        """
         if self.phase == PHASE_STIM:
             return self._stim_target(now), 0
         if self.phase == PHASE_COOL:
@@ -334,20 +234,12 @@ class EdgeGuard:
 
     def step(self, pressure: float | None, edge: int | None,
              fresh: bool, now: float) -> None:
-        """推进一拍状态转移。
-
-        :param pressure: 平滑 + 漏气补偿后气压 (kPa)；``fresh`` 为假时忽略
-        :param edge: 官方边控状态 0-4（无会话为 None）
-        :param fresh: 气压读数是否在 ``sensor_timeout_s`` 内（失联 fail-safe）
-        :param now: monotonic 时间戳
-        """
         dt = 0.0
         if self._last_now is not None:
             dt = min(MAX_STEP_DT, max(0.0, now - self._last_now))
         self._last_now = now
         mode = self._mode()
         if mode == "off" or not fresh:
-            # off 模式不闭环；气压失联 fail-safe 归零待机
             self._enter(PHASE_IDLE, now)
             self._history.clear()
             return
@@ -357,7 +249,6 @@ class EdgeGuard:
         if mode == "app":
             self._step_app(edge, now)
             return
-        # sensor：释放计时——release_s=0 保持释放（直到暂停/失联）
         if self.phase == PHASE_RELEASE:
             release_s = self._f("release_s")
             if release_s > 0 and (now - self.phase_since) >= release_s:
@@ -365,10 +256,6 @@ class EdgeGuard:
         self._step_sensor(pressure, now)
 
     def _step_app(self, edge: int | None, now: float) -> None:
-        """跟随官方边控会话（Socket V4 ``edgeState`` 0-4）：
-        1 刺激 → 维持刺激；2/3 冷静计时/判定 → 撤除（惩罚窗口同 sensor）；
-        4 允许高潮 → 释放（助力强度）；0 停止 / 无会话 → 待机。
-        次数/时长释放不介入，离开释放自动清零循环计数。"""
         state = int(edge) if edge is not None else 0
         if state == 1:
             self._enter(PHASE_STIM, now)
@@ -380,15 +267,6 @@ class EdgeGuard:
             self._enter(PHASE_IDLE, now)
 
     def _step_sensor(self, pressure: float | None, now: float) -> None:
-        """气压闭环（判定条件对标官方设置页）：
-
-        * 刺激期：气压高于红线（可要求持续 N 秒）或短窗口上升速率达
-          跳变阈值 → 判到边。**到边分流**：已满足释放条件（边控次数
-          达限 / 会话时长达限）→ 释放边（不设惩罚器、刺激器=助力强度、
-          循环计数置零）；否则 → 冷静边（惩罚窗口、循环 +1）；
-        * 冷静期：满最小冷静时间且气压低于蓝线（可要求持续 N 秒）→
-          恢复刺激。
-        """
         if pressure is None:
             self._enter(PHASE_IDLE, now)
             return
@@ -396,7 +274,7 @@ class EdgeGuard:
             self._enter(PHASE_STIM, now)
             return
         if self.phase == PHASE_RELEASE:
-            return                       # 由释放计时 / 失联 / 暂停退出
+            return
         red = self.red_threshold()
         blue = self.blue_threshold()
         if self.phase == PHASE_STIM:
@@ -413,7 +291,6 @@ class EdgeGuard:
                     and self._rise_rate(now) >= self._f("jump_rise"))
             if held or jump:
                 if self._release_allowed(now):
-                    # 释放边：不设惩罚器、刺激器=助力强度、循环置零
                     self._enter(PHASE_RELEASE, now)
                     self.cycles = 0
                 else:
@@ -435,9 +312,6 @@ class EdgeGuard:
                 self._enter(PHASE_STIM, now)
 
     def _release_allowed(self, now: float) -> bool:
-        """允许释放：边控次数达限（官方「固定模式」）或会话时长达限
-        （官方「游戏进行指定时长后允许高潮释放」）——满足后在下一次到边
-        时进入释放期。"""
         limit = self._i("cycle_limit")
         if 0 < limit <= self.cycles:
             return True
@@ -446,17 +320,7 @@ class EdgeGuard:
                 and (now - self.session_since) >= time_release)
 
 
-# ---------------------------------------------------------------- 桥接器
-
 class MarginBridge:
-    """灵猫边控运行时：气压/边控状态读取 + 闭环状态机 + 映射表派发。
-
-    :param config: 模块配置（MarginConfig，reload_config 时原位更新）
-    :param get_state: 引擎状态回调（``ctx.engine.get_state``）
-    :param commands: 引擎命令层（``ctx.engine``；仅经映射派发器间接使用，
-                     模块不直接调用任何设备命令）
-    :param events: 应用事件总线（保留，当前无订阅）
-    """
 
     def __init__(self, config: MarginConfig, get_state: Callable[[], Any],
                  commands: Any, events=None):
@@ -468,7 +332,7 @@ class MarginBridge:
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task | None = None
-        self._clock: Callable[[], float] = time.monotonic   # 测试可注入
+        self._clock: Callable[[], float] = time.monotonic
 
         self.paused = False
         self.guard = EdgeGuard(config)
@@ -479,8 +343,6 @@ class MarginBridge:
         self._last_phase: int = PHASE_IDLE
         self.last_values: dict[str, float] = {}
 
-        # 映射引擎：信号空间 = 边控变量 ∪ 核心输出参数实时值；
-        # 设备动作只由输入映射表求值派发（build_dispatchers 派发器）
         self.engine = MappingEngine(self._dispatch,
                                     device_vars=self._device_vars,
                                     ranges=input_ranges())
@@ -489,18 +351,8 @@ class MarginBridge:
         self._primed = False
         self.apply_config()
 
-    # ---- 映射表 ---------------------------------------------------------
 
     def apply_config(self) -> None:
-        """装载两张映射表；首轮输入表只静默求值，避免启动即把设备写成 0。
-
-        **映射表只来自配置文件**（模块零内置兜底行）：
-
-        * 输入表（模块 → 核心）：显式 ``mappings`` 行 > 配置链 ``events``
-          推送行（``param ← var``）> 空（不推送任何数值）；
-        * 输出表（核心 → 模块）：``outputs`` 行 > 空（不读任何设备数据，
-          闭环待机）。
-        """
         first = not self._primed
         if first:
             self.engine.armed = False
@@ -512,8 +364,6 @@ class MarginBridge:
             self._primed = True
 
     def _seed_temps(self) -> None:
-        """播种 temps 静态变量（行 {name, value}；重载不覆盖已有值；
-        {name, expr} 派生变量由 _publish_temps 每拍计算）。"""
         for temp in self.config.get("temps") or []:
             if not isinstance(temp, dict):
                 continue
@@ -527,15 +377,11 @@ class MarginBridge:
             self.engine.signals.setdefault(name, value)
 
     def _rows_of(self, key: str) -> list[dict[str, str]]:
-        """配置映射行（只认配置文件，无内置兜底）。"""
         return [row for row in (self.config.get(key) or [])
                 if isinstance(row, dict)
                 and str(row.get("param") or "").strip()]
 
     def _rows_from_events(self) -> list[dict[str, str]]:
-        """配置链 events → 输入映射行：动作 ``{dir: "in", param: 核心输入
-        参数, var: 变量名}`` 即纯数值推送行 ``param ← {var}``（var 来自
-        temps 派生变量或模块变量），每拍连续推送。"""
         out: list[dict[str, str]] = []
         for event in self.config.get("events") or []:
             if not isinstance(event, dict):
@@ -552,21 +398,15 @@ class MarginBridge:
         return out
 
     def _effective_rows(self) -> list[dict]:
-        """模块 → 核心（输入映射表）：显式 mappings 行优先，其次配置链
-        events 声明的 ``param ← var`` 推送行；两者皆无 → 空表（不推送）。"""
         user = self._rows_of("mappings")
         if user:
             return user
         return self._rows_from_events()
 
     def _effective_output_rows(self) -> list[dict]:
-        """核心 → 模块（输出映射表）：只来自配置 ``outputs`` 行，空表 =
-        不读任何设备数据。"""
         return self._rows_of("outputs")
 
     def _publish_temps(self) -> None:
-        """temps 派生变量：行 {name, expr} 每拍对模块变量求值后发布
-        （{name, value} 静态播种由 _seed_temps 处理）。"""
         for temp in self.config.get("temps") or []:
             if not isinstance(temp, dict):
                 continue
@@ -587,12 +427,6 @@ class MarginBridge:
             return None
 
     def _device_vars(self) -> dict[str, float]:
-        """输出映射表的求值值空间 = 核心输出参数空间（``家族.信号``）。
-
-        这是模块**唯一**的设备数据触点：把引擎状态折算成核心输出参数
-        id（BMTR.Pressure 等），仅供输出映射表行表达式求值使用——模块
-        逻辑（状态机/判定/日志）只消费输出表的求值结果 ``out_values``。
-        """
         vals = device_state_values(self._safe_state())
         vals.update(core_alias_values(vals))
         return vals
@@ -607,8 +441,6 @@ class MarginBridge:
             self.log(f"映射派发 {target}={value} 失败: {exc!r}")
 
     class _DeviceApi:
-        """核心参数派发器适配（纯数值推送）：模块不管理设备，仅按核心
-        输入路由定位（各类型首台，跳过灵猫）——与核心输入定位语义一致。"""
 
         def __init__(self, bridge: "MarginBridge"):
             self._b = bridge
@@ -661,7 +493,6 @@ class MarginBridge:
         def run(self, coro) -> None:
             self._b._spawn(coro)
 
-    # ---- 生命周期 -------------------------------------------------------
 
     async def start(self) -> None:
         if self._running:
@@ -679,8 +510,6 @@ class MarginBridge:
         if self._task:
             self._task.cancel()
             self._task = None
-        # 经映射表归零：状态机归位待机并把两路输出清零重新求值——
-        # 映射行结果变化（如刺激器 60→0）即派发归零；表无强度行则不动设备
         self.guard.reset(self._clock())
         self.engine.signal("stim_strength", 0)
         self.engine.signal("punish_strength", 0)
@@ -688,25 +517,20 @@ class MarginBridge:
         self.log("灵猫边控联动已停止")
 
     def close(self) -> None:
-        """模块卸载清理（宿主先经 stop() 归零，这里兜底停拍）。"""
         self._running = False
         if self._task:
             self._task.cancel()
             self._task = None
 
     async def reload_config(self) -> None:
-        """联动页保存设置后由宿主调用：映射表与闭环参数热生效。"""
         self.apply_config()
 
     def toggle_pause(self) -> bool:
-        """暂停/恢复闭环（负鼠按键动作）：暂停即状态机归位，下一拍两路
-        输出清零经映射表派发归零，恢复后重新爬升。"""
         self.paused = not self.paused
         self.log("边控闭环已暂停（输出经映射表归零）" if self.paused
                  else "边控闭环已恢复")
         return self.paused
 
-    # ---- 节拍与状态机推进 -------------------------------------------------
 
     async def _tick_loop(self) -> None:
         try:
@@ -721,16 +545,11 @@ class MarginBridge:
 
     def _tick(self) -> None:
         cfg = self.config
-        # 核心 → 模块：刷新输出表求值（out_values 从核心输出信号空间取数）
         self.engine.pump()
         raw = self.engine.out_values.get("pressure")
         edge = self.engine.out_values.get("edge")
         now = self._clock()
 
-        # 失联/无读数判定：平滑 + 漏气补偿后的有效气压 > EPSILON 才是有效
-        # 读数（设备离线时输出表恒为 0.0；「气压清零」后静息在 0 附近抖动，
-        # ε 消除穿越 0 判界导致的待机/刺激抖动）；读数为正但在
-        # sensor_timeout_s 内无任何变化同样视为失联（设备读数冻结）
         timeout = max(1.0, self._cfg_f(cfg, "sensor_timeout_s", 5.0))
         if raw is not None and raw != self._last_pressure_seen:
             self._last_pressure_seen = raw
@@ -744,7 +563,6 @@ class MarginBridge:
                 self._smoothed = float(raw)
             else:
                 self._smoothed += (1.0 - smooth) * (float(raw) - self._smoothed)
-        # 漏气补偿：叠加到平滑读数上的固定偏移（腔体漏气读数偏低时调大）
         leak = self._cfg_f(cfg, "leak_comp", 0.0)
         pressure = (self._smoothed + leak) if self._smoothed is not None \
             else None
@@ -760,7 +578,6 @@ class MarginBridge:
 
         stim, punish = self.guard.outputs(now)
         on_edge = 1 if fresh and pressure >= self.guard.red_threshold() else 0
-        # 模块 → 核心：映射变量发布（输入映射表引用后派发）
         self.engine.signal("pressure", round(pressure or 0.0, 2))
         self.engine.signal("edge", int(edge) if edge is not None else 0)
         self.engine.signal("stim_strength", stim)
@@ -777,7 +594,6 @@ class MarginBridge:
                             for name in PARAM_DEFS}
 
     def _log_phase(self) -> None:
-        """阶段切换提示（每次变化一条，含当前循环计数与自适应阈值）。"""
         if self.guard.phase == self._last_phase:
             return
         prev, self._last_phase = self._last_phase, self.guard.phase
@@ -796,7 +612,6 @@ class MarginBridge:
             return default
 
     def _log_offline(self, fresh: bool, now: float) -> None:
-        """气压失联提示：每 30s 至多一条（无灵猫时提示绑定缺失）。"""
         mode = str(self.config.get("mode") or "sensor")
         if self.paused or mode == "off" or fresh:
             return

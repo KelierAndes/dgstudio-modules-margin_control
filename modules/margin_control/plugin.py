@@ -1,28 +1,3 @@
-"""灵猫边控联动模块：纯数值推送的双向映射管道（核心 ⇄ 模块）。
-
-模块**不做任何设备管理**，全部数值经两张映射表流动：
-
-* 核心 → 模块（输出映射表，``META["reads"]`` 声明）：``BMTR.Pressure →
-  pressure``、``BMTR.EdgeState → edge``——从核心输出信号空间读入传感值，
-  换绑其它灵猫 = 改输出表行（如 ``BMTR.2.Pressure``）；
-* 模块 → 核心（输入映射表）：发布 ``stim_strength`` / ``punish_strength``
-  等命名数值，默认行 ``in_strength_a/b ← max({stim_strength},
-  {punish_strength})``——目标设备/通道完全由核心输入参数 id 决定
-  （``in_*`` 郊狼、``in_ovc_*`` 负鼠），模块只推数、不选设备。
-
-闭环状态机（判定条件与阈值自适应对标 DG-Lab 官方边控玩法设置页）：
-
-* ``sensor`` 气压闭环：红线/蓝线 + 持续判定 + 气压跳变判到边；最小冷静
-  时间满且气压回落恢复；边控次数或会话时长达限进释放期（助力强度经刺激
-  器变量输出）；阈值自适应（边控后红线下降、超时线性缓降有下限、蓝线
-  跟随/回升）；
-* ``app`` 跟随官方边控会话：刺激/冷静/允许高潮四态驱动变量；
-* ``off`` 只提供映射变量。
-
-META["config"] 声明全部配置项（分组对齐官方设置页），宿主装载
-config/margin_control.json 时自动补齐缺省，联动页据此渲染映射表与模块
-设置；另有负鼠按键动作「灵猫气压清零」「边控闭环暂停/恢复」。
-"""
 
 META = {
     "id": "margin_control",
@@ -51,14 +26,12 @@ META = {
         "cycles": {"label": "边控循环", "desc": "当前轮「到边→冷静」计数；释放完成"
                                               "后清零重新计"},
     },
-    # 可读参数：核心输出信号 → 模块读入变量（输出映射表默认行，可重定向）
     "reads": {
         "Pressure": {"label": "气压 (kPa)", "name": "pressure",
                      "type": "Float"},
         "EdgeState": {"label": "官方边控状态", "name": "edge", "type": "Int"},
     },
     "config": {
-        # ---- 基础设置 ----
         "mode": {
             "label": "边控模式", "type": "choice",
             "choices": ["sensor", "app", "off"], "default": "sensor",
@@ -79,7 +52,6 @@ META = {
             "group": "basic",
             "desc": "超过该时长没有新的气压读数视为灵猫失联，闭环归零待机",
         },
-        # ---- 判定条件（对标官方「判定条件」页） ----
         "edge_threshold": {
             "label": "边缘气压阈值 (kPa)", "type": "float",
             "default": 17.0, "min": 1.0, "max": 60.0, "step": 0.1,
@@ -125,7 +97,6 @@ META = {
             "group": "judge",
             "desc": "连续 N 秒低于蓝线才判断彻底冷静、恢复刺激，0=立即",
         },
-        # ---- 释放（对标官方「允许高潮释放」条件） ----
         "cycle_limit": {
             "label": "边控次数释放 (轮)", "type": "int",
             "default": 5, "min": 0, "max": 99,
@@ -147,7 +118,6 @@ META = {
             "desc": "释放期持续该时长后循环计数清零、重新开始刺激；"
                     "0=保持释放直到暂停/失联（仅 sensor 模式计时）",
         },
-        # ---- 强度设置（对标官方「刺激器设置」页） ----
         "stim_strength": {
             "label": "刺激强度", "type": "int",
             "default": 60, "min": 0, "max": 200,
@@ -187,7 +157,6 @@ META = {
             "group": "strength",
             "desc": "惩罚输出的持续时长，0=关闭惩罚",
         },
-        # ---- 阈值自适应调整（对标官方「阈值自适应调整」） ----
         "adapt_stim": {
             "label": "刺激阶段红线自适应", "type": "bool",
             "default": True,
@@ -244,7 +213,6 @@ META = {
             "desc": "叠加到气压读数上的固定补偿（腔体漏气读数偏低时调大；"
                     "官方默认 3）",
         },
-        # ---- 两张映射表（纯数值推送的双向管道） ----
         "mappings": {
             "label": "输入映射表（模块 → 核心）", "type": "list",
             "default": [], "group": "map", "rows": "in",
@@ -263,7 +231,6 @@ META = {
                     "全空 = 不读任何设备数据（模块零内置兜底行，链路只"
                     "来自配置；装载时空表会按「可读参数」补默认行）",
         },
-        # ---- 配置链推送（与映射表等价的传统书写，兼容既有配置） ----
         "events": {
             "label": "推送链（param ← var）", "type": "list",
             "default": [], "group": "map",
@@ -289,13 +256,10 @@ from modules.margin_control import bridge as _bridge_mod
 from modules.margin_control.bridge import (PARAM_DEFS, MarginBridge,
                                            MarginConfig)
 
-# 配置缺省值唯一来源 = META["config"] 声明，MarginConfig 仅做兜底
 MARGIN_CONFIG_DEFAULTS = spec_defaults(META["config"])
 
 
 def _signal_spec(signal: str) -> dict | None:
-    """核心输出信号名 → 参数定义（跨家族解析：郊狼 → 负鼠 → 灵猫取第一个
-    有该信号的家族），供输出表默认行落地。"""
     from dglab.params import output_specs
 
     for family in ("COYOTE", "OVC", "BMTR"):
@@ -306,8 +270,6 @@ def _signal_spec(signal: str) -> dict | None:
 
 
 def materialize_reads(settings: dict) -> bool:
-    """空输出表按 META["reads"] 落地默认可读行（``BMTR.Pressure →
-    pressure`` 等），写入设置文件；已有输出行则不动。"""
     if any(isinstance(row, dict) and str(row.get("name") or "").strip()
            for row in (settings.get("outputs") or [])):
         return False
@@ -340,16 +302,13 @@ class MarginControlModule(ModuleBase):
         self.ctx = None
 
     def config_spec(self) -> dict:
-        """配置项声明（宿主优先按实例声明渲染联动页设置区）。"""
         return dict(META["config"])
 
     def link_params(self) -> list[tuple[str, str]]:
-        """模块 → 核心的命名数值（输入映射表表达式变量池）。"""
         return [(name, str(item.get("label") or ""))
                 for name, item in PARAM_DEFS.items()]
 
     def read_params(self) -> list[tuple[str, str]]:
-        """核心 → 模块的可读信号（输出映射表默认字段）。"""
         return [(f"BMTR.{signal}", str(item.get("label") or signal))
                 for signal, item in META["reads"].items()]
 
@@ -381,7 +340,6 @@ class MarginControlModule(ModuleBase):
         await self.bridge.start()
 
     async def reload_config(self) -> None:
-        """映射表与闭环参数编辑后立即热生效。"""
         if self.bridge is None:
             return
         for key in MARGIN_CONFIG_DEFAULTS:
@@ -397,7 +355,6 @@ class MarginControlModule(ModuleBase):
         return self.bridge is not None and bool(getattr(self.bridge,
                                                         "_running", False))
 
-    # ---- 负鼠按键动作（§3：回调在引擎线程，快速返回） -------------------
 
     def button_actions(self) -> list:
         from plugins import ButtonAction
@@ -410,14 +367,12 @@ class MarginControlModule(ModuleBase):
         ]
 
     def _press_reset_pressure(self, slot_id, argument) -> None:
-        """灵猫气压清零（校准静息 0 点；仅蓝牙直连灵猫支持）。"""
         if self.ctx is None:
             return
         fut = self.ctx.submit(self.ctx.engine.reset_pressure())
         fut.add_done_callback(self._log_future)
 
     def _press_guard_toggle(self, slot_id, argument) -> None:
-        """暂停/恢复闭环（暂停即两路输出归零，经映射表落地）。"""
         if self.ctx is None:
             return
         if self.bridge is None:
