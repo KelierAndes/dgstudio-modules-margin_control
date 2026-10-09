@@ -21,150 +21,90 @@ from modules.margin_control.plugin import (MARGIN_CONFIG_DEFAULTS, META,
 _FAST_JUDGE = {"edge_hold_s": 0.0, "recovery_hold_s": 0.0, "jump_rise": 0.0,
                "sensor_timeout_s": 3600.0}
 
+# 宿主 ModuleContext 已拦下的设备直写方法 + 直写设备固件的旁路命令：
+# 模块一旦碰到就抛，守门用例据此证明闭环全程不碰设备
+BLOCKED_METHODS = ("set_strength", "add_strength", "reset_strength", "set_wave",
+                   "push_pulse_stream", "fire", "fire_start", "fire_stop",
+                   "zap", "set_intensity_param", "reset_pressure",
+                   "emergency_stop")
 
-class FakeCommands:
 
-    def __init__(self):
-        self.state = EngineState(backend="ble")
+class DeviceTamper(Exception):
+    """设备被模块碰到的信号。"""
+
+
+class NeverCommands:
+    """替代宿主引擎：任何设备动作都立刻抛错，同时提供只读的 state。"""
+
+    def __init__(self, pressure: float | None = None,
+                 edge: int | None = None):
+        self.state = EngineState(backend="ble", connected=True, paired=True)
         self.state.slots["s_out"] = Slot(slot_id="s_out", name="郊狼",
                                          type="COYOTE_030")
         self.state.slots["s_bmt"] = Slot(slot_id="s_bmt", name="灵猫",
                                          type="BMTR_010")
-        self.strength_calls: list[tuple[str, int, str | None]] = []
-        self.zap_calls: list[tuple[str, float, str | None]] = []
-        self.fire_calls: list[tuple] = []
-        self.reset_calls: list[tuple] = []
-        self.selection = {"A": SILENT, "B": SILENT}
-
+        if pressure is not None:
+            self.state.slots["s_bmt"].pressure = pressure
+        if edge is not None:
+            self.state.slots["s_bmt"].edge_state = edge
+        self.touched: list[str] = []
 
     def get_state(self):
         return self.state
 
-    def resolve_slot(self, slot_id=None, family=None, output_only=False):
-        if slot_id:
-            return slot_id
-        if family:
-            for sid in sorted(self.state.slots):
-                slot = self.state.slots[sid]
-                if slot.type.upper().startswith(family):
-                    return sid
-            return None
-        for sid in sorted(self.state.slots):
-            if not output_only or self.state.slots[sid].is_output_device:
-                return sid
-        return None
-
     def wave_selection(self):
-        return dict(self.selection)
+        return {"A": SILENT, "B": SILENT}
 
 
-    def set_strength(self, channel, value, slot_id=None):
-        self.strength_calls.append((channel, int(value), slot_id))
-
-        async def _noop():
-            pass
-        return _noop()
-
-    def set_wave(self, channel, name, slot_id=None):
-        async def _noop():
-            pass
-        return _noop()
-
-    def zap(self, channel, seconds=1.0, slot_id=None):
-        self.zap_calls.append((channel, float(seconds), slot_id))
-
-        async def _noop():
-            pass
-        return _noop()
-
-    def fire(self, *args, **kwargs):
-        self.fire_calls.append(args)
-
-        async def _noop():
-            pass
-        return _noop()
-
-    def fire_start(self, slot_id=None, channel=None):
-        self.fire_calls.append(("start", slot_id, channel))
-
-        async def _noop():
-            pass
-        return _noop()
-
-    def fire_stop(self, slot_id=None, channel=None):
-        self.fire_calls.append(("stop", slot_id, channel))
-
-        async def _noop():
-            pass
-        return _noop()
-
-    def reset_strength(self, channel, slot_id=None):
-        self.reset_calls.append((channel, slot_id))
-
-        async def _noop():
-            pass
-        return _noop()
-
-    def emergency_stop(self):
-        async def _noop():
-            pass
-        return _noop()
+def _tamper(name: str):
+    def _raise(self, *args, **kwargs):
+        self.touched.append(name)
+        raise DeviceTamper(f"模块直写设备被调用：{name}()")
+    return _raise
 
 
-def _commands(pressure: float | None = None,
-              edge: int | None = None) -> FakeCommands:
-    commands = FakeCommands()
-    if pressure is not None:
-        commands.state.slots["s_bmt"].pressure = pressure
-    if edge is not None:
-        commands.state.slots["s_bmt"].edge_state = edge
-    return commands
+for _name in BLOCKED_METHODS:
+    setattr(NeverCommands, _name, _tamper(_name))
 
 
-_TEST_READ = {"name": "气压读取", "trigger": "period", "arg": 50,
-              "actions": [
-                  {"dir": "out", "param": "BMTR.Pressure", "var": "pressure"},
-                  {"dir": "out", "param": "BMTR.EdgeState", "var": "edge"}]}
-_TEST_PUSH = {"name": "强度推送", "trigger": "period", "arg": 50,
-              "actions": [
-                  {"dir": "in", "param": "in_strength_a",
-                   "var": "strength_out"},
-                  {"dir": "in", "param": "in_strength_b",
-                   "var": "strength_out"}]}
-_TEST_EVENTS = [_TEST_READ, _TEST_PUSH]
-_TEST_TEMPS = [{"name": "strength_out",
-                "expr": "max({stim_strength}, {punish_strength})"}]
-_CARD_STEP = 0.06
+class _Ingest:
+    """模拟宿主事件流的写入卡片：把核心读数写进模块的共享变量。
+
+    v0.12 起闭环的输入不再由模块自己读设备，而是事件流把 ``BMTR.Pressure`` /
+    ``BMTR.EdgeState`` 写进 ``pressure`` / ``edge`` 两个变量；单测里用这个对象
+    代替画布，每拍 ``_tick()`` 前把当前读数落到变量表上。
+    """
+
+    def __init__(self, bridge: MarginBridge, pressure=None, edge=None):
+        self.bridge = bridge
+        self.pressure = pressure
+        self.edge = edge
+
+    def write(self) -> None:
+        if self.pressure is not None:
+            self.bridge.engine.temps["pressure"] = float(self.pressure)
+        if self.edge is not None:
+            self.bridge.engine.temps["edge"] = int(self.edge)
 
 
-def _bridge(config: dict | None = None, commands: FakeCommands | None = None,
-            clock: float = 100.0) -> tuple[MarginBridge, FakeCommands]:
-    commands = commands or _commands()
+def _bridge(config: dict | None = None, commands: NeverCommands | None = None,
+            clock: float = 100.0, pressure=None,
+            edge=None) -> tuple[MarginBridge, NeverCommands, _Ingest]:
+    commands = commands or NeverCommands(pressure=pressure, edge=edge)
     merged = dict(_FAST_JUDGE)
     merged.update(config or {})
-    if "events" not in merged:
-        merged["events"] = _TEST_EVENTS
-    if "temps" not in merged:
-        merged["temps"] = _TEST_TEMPS
     bridge = MarginBridge(MarginConfig(merged), commands.get_state, commands)
     bridge.log = lambda msg: None
     bridge._clock = lambda: clock
+    bridge.ingest = _Ingest(bridge, pressure, edge)
     bridge.tick_at = lambda t: _advance(bridge, t)
-    return bridge, commands
+    return bridge, commands, bridge.ingest
 
 
 def _advance(bridge: MarginBridge, t: float) -> None:
     bridge._clock = lambda: t
-    bridge.engine.tick_event_cards(t - _CARD_STEP)
+    bridge.ingest.write()
     bridge._tick()
-    bridge.engine.tick_event_cards(t)
-
-
-def _strength_by_channel(commands: FakeCommands) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for ch, value, _sid in commands.strength_calls:
-        out[ch] = value
-    return out
 
 
 class GuardSensorTests(unittest.TestCase):
@@ -202,7 +142,6 @@ class GuardSensorTests(unittest.TestCase):
         self.assertEqual(guard.cycles, 1)
         self.assertEqual(guard.outputs(2.5), (0, 0))
 
-
     def test_edge_hold_requires_sustained_above(self):
         guard = self._guard(edge_hold_s=2.0)
         guard.step(10.0, None, True, now=0.0)
@@ -234,7 +173,6 @@ class GuardSensorTests(unittest.TestCase):
         guard.step(5.0, None, True, now=5.1)
         self.assertEqual(guard.phase, PHASE_STIM)
 
-
     def test_jump_rate_triggers_edge_below_threshold(self):
         guard = self._guard(jump_rise=5.0, jump_window_s=1.0)
         guard.step(10.0, None, True, now=0.0)
@@ -249,7 +187,6 @@ class GuardSensorTests(unittest.TestCase):
         guard.step(10.0, None, True, now=0.5)
         guard.step(13.0, None, True, now=1.5)
         self.assertEqual(guard.phase, PHASE_STIM)
-
 
     def test_punish_window_outputs_then_expires(self):
         guard = self._guard(ramp_s=0.0, punish_strength=120, punish_s=1.5)
@@ -312,7 +249,6 @@ class GuardSensorTests(unittest.TestCase):
         self.assertEqual(guard.outputs(5.0)[0], 50)
         self.assertEqual(guard.outputs(12.0)[0], 100)
 
-
     def test_adaptive_red_drops_after_edge_and_blue_follows(self):
         guard = self._guard(adapt_stim=True, adapt_drop_pct=10.0,
                             adapt_blue_follow=30.0)
@@ -367,7 +303,6 @@ class GuardSensorTests(unittest.TestCase):
         self.assertAlmostEqual(guard.blue_threshold(), 15.0)
         guard.step(15.5, None, True, now=20.0)
         self.assertAlmostEqual(guard.blue_threshold(), 15.0)
-
 
     def test_cycle_limit_release_at_next_edge(self):
         guard = self._guard(ramp_s=0.0, cooldown_s=5.0,
@@ -478,25 +413,65 @@ class GuardAppTests(unittest.TestCase):
 
 
 class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
-    def test_tick_feeds_variables_and_drives_strength(self):
-        bridge, commands = _bridge({"ramp_s": 0.0},
-                                   commands=_commands(pressure=10.0))
+
+    def test_tick_ingests_variables_and_publishes_strength(self):
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0}, pressure=10.0)
         bridge.tick_at(100.0)
+        self.assertAlmostEqual(bridge.engine.temps["pressure"], 10.0)
         self.assertAlmostEqual(bridge.engine.signals["pressure"], 10.0)
         self.assertEqual(bridge.engine.signals["stim_strength"], 60)
         self.assertEqual(bridge.engine.signals["punish_strength"], 0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
-        self.assertEqual(commands.zap_calls, [])
-        self.assertEqual(commands.fire_calls, [])
-        self.assertEqual(commands.reset_calls, [])
+        self.assertEqual(bridge.engine.mappings, {})
+        self.assertEqual(bridge.engine.outputs, [])
+        self.assertEqual(bridge.engine.out_values, {})
+        self.assertEqual(commands.touched, [])
 
+    def test_crossing_edge_publishes_punish_then_zeroes(self):
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0, "smooth": 0.0,
+                                            "punish_strength": 120,
+                                            "punish_s": 1.0,
+                                            "cooldown_s": 0.0,
+                                            "recovery_threshold": 20.0},
+                                           pressure=10.0)
+        bridge.tick_at(100.0)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
+        ingest.pressure = 45.0
+        bridge.tick_at(110.0)
+        self.assertEqual(bridge.guard.phase, PHASE_COOL)
+        self.assertEqual(bridge.engine.signals["punish_strength"], 120)
+        self.assertEqual(bridge.engine.signals["cycles"], 1)
+        bridge.tick_at(112.0)
+        self.assertEqual(bridge.engine.signals["punish_strength"], 0)
+        self.assertEqual(commands.touched, [])
+
+    def test_release_phase_publishes_assist_strength(self):
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0, "smooth": 0.0,
+                                            "cooldown_s": 0.0,
+                                            "recovery_threshold": 20.0,
+                                            "cycle_limit": 1,
+                                            "release_s": 0.0,
+                                            "assist_strength": 90,
+                                            "punish_strength": 120},
+                                           pressure=10.0)
+        bridge.tick_at(100.0)
+        self.assertEqual(bridge.engine.signals["on_release"], 0)
+        ingest.pressure = 45.0
+        bridge.tick_at(110.0)
+        ingest.pressure = 5.0
+        bridge.tick_at(120.0)
+        ingest.pressure = 45.0
+        bridge.tick_at(130.0)
+        self.assertEqual(bridge.engine.signals["on_release"], 1)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 90)
+        self.assertEqual(bridge.engine.signals["punish_strength"], 0)
+        self.assertEqual(commands.touched, [])
 
     def test_red_timed_decay_is_linear_and_floored(self):
-        bridge, commands = _bridge({"adapt_stim": True,
-                                    "adapt_drop_delay_s": 10.0,
-                                    "adapt_drop_rate": 10.0,
-                                    "smooth": 0.0},
-                                   commands=_commands(pressure=10.0))
+        bridge, commands, ingest = _bridge({"adapt_stim": True,
+                                            "adapt_drop_delay_s": 10.0,
+                                            "adapt_drop_rate": 10.0,
+                                            "smooth": 0.0},
+                                           pressure=10.0)
         bridge.tick_at(100.0)
         t = 100.0
         for _ in range(6000):
@@ -507,138 +482,69 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(red, bridge.guard.blue_threshold() + 0.5)
 
     def test_red_edge_drop_respects_floor(self):
-        bridge, commands = _bridge({"adapt_stim": True,
-                                    "adapt_drop_pct": 90.0,
-                                    "adapt_blue_follow": 0.0, "smooth": 0.0},
-                                   commands=_commands(pressure=10.0))
+        bridge, commands, ingest = _bridge({"adapt_stim": True,
+                                            "adapt_drop_pct": 90.0,
+                                            "adapt_blue_follow": 0.0,
+                                            "smooth": 0.0}, pressure=10.0)
         bridge.tick_at(100.0)
-        commands.state.slots["s_bmt"].pressure = 45.0
+        ingest.pressure = 45.0
         bridge.tick_at(110.0)
         self.assertAlmostEqual(bridge.guard.red_threshold(), 15.5)
         self.assertGreaterEqual(bridge.guard.red_threshold(),
                                 bridge.guard.blue_threshold() + 0.5)
 
-
-    def test_event_stream_ingests_pressure(self):
-        commands = _commands(pressure=10.0)
-        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0}, commands)
+    def test_app_mode_ingests_edge_variable(self):
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0, "mode": "app",
+                                            "smooth": 0.0},
+                                           pressure=10.0, edge=1)
         bridge.tick_at(100.0)
-        self.assertAlmostEqual(bridge.engine.temps["pressure"], 10.0)
-        self.assertIn("edge", bridge.engine.temps)
-        self.assertEqual(bridge.engine.outputs, [])
-        self.assertEqual(bridge.engine.mappings, {})
-        self.assertAlmostEqual(bridge.engine.signals["pressure"], 10.0)
-        commands.state.slots["s_bmt"].pressure = 45.0
+        self.assertEqual(bridge.engine.signals["edge"], 1)
+        self.assertEqual(bridge.guard.phase, PHASE_STIM)
+        ingest.edge = 4
         bridge.tick_at(110.0)
-        self.assertEqual(bridge.guard.phase, PHASE_COOL)
+        self.assertEqual(bridge.guard.phase, PHASE_RELEASE)
+        self.assertEqual(commands.touched, [])
 
-    def test_out_action_redirects_second_bmtr(self):
-        commands = _commands(pressure=10.0)
-        commands.state.slots["s_bmt2"] = Slot(slot_id="s_bmt2", name="灵猫2",
-                                              type="BMTR_1")
-        commands.state.slots["s_bmt2"].pressure = 33.0
-        read2 = {"name": "气压读取2", "trigger": "period", "arg": 50,
-                 "actions": [{"dir": "out", "param": "BMTR.2.Pressure",
-                              "var": "pressure"}]}
-        bridge, commands = _bridge(
-            {"ramp_s": 0.0, "smooth": 0.0, "events": [read2, _TEST_PUSH]},
-            commands)
+    def test_host_attach_temps_shares_variable_space(self):
+        shared = {"punish": 5.0}
+        bridge, commands, ingest = _bridge(
+            {"ramp_s": 0.0, "smooth": 0.0,
+             "temps": [{"name": "seed", "value": 7.0}]}, pressure=10.0)
+        bridge.engine.attach_temps(shared)
         bridge.tick_at(100.0)
-        self.assertAlmostEqual(bridge.engine.temps["pressure"], 33.0)
-        self.assertAlmostEqual(bridge.engine.signals["pressure"], 33.0)
+        self.assertIs(bridge.engine.temps, shared)
+        self.assertAlmostEqual(shared["pressure"], 10.0)
+        self.assertAlmostEqual(shared["punish"], 5.0)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
+        self.assertEqual(commands.touched, [])
 
     def test_frozen_pressure_failsafe(self):
-        commands = _commands(pressure=10.0)
-        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
-                                    "sensor_timeout_s": 1.0}, commands)
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0, "smooth": 0.0,
+                                            "sensor_timeout_s": 1.0},
+                                           pressure=10.0)
         bridge.tick_at(100.0)
         self.assertEqual(bridge.guard.phase, PHASE_STIM)
         for i in range(30):
             bridge.tick_at(101.0 + i * 0.1)
         self.assertEqual(bridge.guard.phase, PHASE_IDLE)
-        commands.state.slots["s_bmt"].pressure = 10.5
+        ingest.pressure = 10.5
         bridge.tick_at(105.0)
         self.assertEqual(bridge.guard.phase, PHASE_STIM)
 
-    def test_user_config_chain_events_temps(self):
-        commands = _commands(pressure=10.0)
-        commands.state.slots["s_ovc"] = Slot(slot_id="s_ovc", name="负鼠",
-                                             type="OVC_1")
-        push = {"name": "双设备推送", "trigger": "period", "arg": 50,
-                "actions": [
-                    {"dir": "in", "param": "in_strength_a", "var": "punish"},
-                    {"dir": "in", "param": "in_ovc_strength_a",
-                     "var": "stim"}]}
-        bridge, commands = _bridge(
-            {"ramp_s": 0.0, "smooth": 0.0,
-             "punish_strength": 100, "stim_strength": 60,
-             "events": [_TEST_READ, push],
-             "temps": [{"name": "punish", "expr": "{punish_strength}"},
-                       {"name": "stim", "expr": "{stim_strength}"}]},
-            commands)
-        bridge.tick_at(100.0)
-        self.assertAlmostEqual(bridge.engine.temps["pressure"], 10.0)
-        by_target = {(ch, sid): v for ch, v, sid in commands.strength_calls}
-        self.assertEqual(by_target[("A", "s_ovc")], 60)
-        commands.state.slots["s_bmt"].pressure = 45.0
-        bridge.tick_at(110.0)
-        by_target = {(ch, sid): v for ch, v, sid in commands.strength_calls}
-        self.assertEqual(by_target[("A", "s_out")], 100)
-        self.assertEqual(by_target[("A", "s_ovc")], 0)
-        self.assertNotIn(("B", "s_out"), by_target)
-        self.assertNotIn(("B", "s_ovc"), by_target)
-
-    def test_host_attach_temps_keeps_ingest(self):
-        shared = {"punish": 5.0}
-        bridge, commands = _bridge(
-            {"ramp_s": 0.0, "smooth": 0.0,
-             "temps": _TEST_TEMPS + [{"name": "seed", "value": 7.0}]},
-            commands=_commands(pressure=10.0))
-        bridge.engine.attach_temps(shared)
-        bridge.tick_at(100.0)
-        self.assertIs(bridge.engine.temps, shared)
-        self.assertAlmostEqual(shared["seed"], 7.0)
-        self.assertAlmostEqual(shared["punish"], 5.0)
-        self.assertAlmostEqual(shared["strength_out"], 60.0)
-        self.assertAlmostEqual(shared["pressure"], 10.0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
-
-    def test_ingest_card_and_push_card_are_independent(self):
-        read_only = {"name": "只读取", "trigger": "period", "arg": 50,
-                     "actions": [{"dir": "out", "param": "BMTR.Pressure",
-                                  "var": "pressure"}]}
-        bridge, commands = _bridge(
-            {"ramp_s": 0.0, "smooth": 0.0, "events": [read_only]},
-            commands=_commands(pressure=10.0))
-        bridge.tick_at(100.0)
-        self.assertAlmostEqual(bridge.engine.temps["pressure"], 10.0)
-        self.assertEqual(commands.strength_calls, [])
-
     def test_zero_noise_no_idle_flap(self):
-        commands = _commands(pressure=0.0)
-        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0},
-                                   commands=_commands(pressure=0.0))
-        bridge.guard  # noqa
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0, "smooth": 0.0},
+                                           pressure=0.0)
         phases = []
         t = 100.0
         for i in range(20):
             t += 0.1
-            commands.state.slots["s_bmt"].pressure = 0.03 if i % 2 else 0.0
+            ingest.pressure = 0.03 if i % 2 else 0.0
             bridge.tick_at(t)
             phases.append(bridge.guard.phase)
         self.assertNotIn(PHASE_STIM, phases)
 
-    def test_push_cards_dispatch_core_params(self):
-        commands = _commands(pressure=10.0)
-        bridge, commands = _bridge({"ramp_s": 0.0}, commands)
-        bridge.tick_at(100.0)
-        self.assertTrue(bridge.engine.has_events())
-        dispatched = {(ch, sid) for ch, _v, sid in commands.strength_calls}
-        self.assertIn(("A", "s_out"), dispatched)
-        self.assertIn(("B", "s_out"), dispatched)
-
     def test_seven_variables_present(self):
-        bridge, _ = _bridge({}, commands=_commands(pressure=30.0))
+        bridge, commands, ingest = _bridge({}, pressure=30.0)
         bridge.tick_at(100.0)
         self.assertEqual(set(bridge.engine.signals), set(PARAM_DEFS))
         self.assertEqual(set(bridge.engine.signals),
@@ -649,159 +555,100 @@ class BridgeTickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bridge.engine.signals["on_release"], 0)
 
     def test_on_edge_flag(self):
-        bridge, _ = _bridge({"edge_threshold": 40.0},
-                            commands=_commands(pressure=30.0))
+        bridge, commands, ingest = _bridge({"edge_threshold": 40.0},
+                                           pressure=30.0)
         bridge.tick_at(100.0)
         self.assertEqual(bridge.engine.signals["on_edge"], 0)
-        bridge2, _ = _bridge({"edge_threshold": 25.0},
-                             commands=_commands(pressure=30.0))
+        bridge2, commands2, ingest2 = _bridge({"edge_threshold": 25.0},
+                                              pressure=30.0)
         bridge2.tick_at(100.0)
         self.assertEqual(bridge2.engine.signals["on_edge"], 1)
 
     def test_leak_compensation_offsets_pressure(self):
-        bridge, _ = _bridge({"leak_comp": 3.0, "smooth": 0.0,
-                             "edge_threshold": 17.0},
-                            commands=_commands(pressure=10.0))
+        bridge, commands, ingest = _bridge({"leak_comp": 3.0, "smooth": 0.0,
+                                            "edge_threshold": 17.0},
+                                           pressure=10.0)
         bridge.tick_at(100.0)
         self.assertAlmostEqual(bridge.engine.signals["pressure"], 13.0)
         self.assertEqual(bridge.engine.signals["on_edge"], 0)
-        bridge2, _ = _bridge({"leak_comp": 3.0, "smooth": 0.0},
-                             commands=_commands(pressure=15.0))
+        bridge2, commands2, ingest2 = _bridge({"leak_comp": 3.0, "smooth": 0.0},
+                                              pressure=15.0)
         bridge2.tick_at(100.0)
         self.assertEqual(bridge2.engine.signals["on_edge"], 1)
 
-    def test_on_release_flag_follows_phase(self):
-        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
-                                    "cooldown_s": 0.0,
-                                    "recovery_threshold": 20.0,
-                                    "cycle_limit": 1, "release_s": 0.0,
-                                    "assist_strength": 90,
-                                    "punish_strength": 120},
-                                   commands=_commands(pressure=10.0))
-        bridge.tick_at(100.0)
-        self.assertEqual(bridge.engine.signals["on_release"], 0)
-        commands.state.slots["s_bmt"].pressure = 45.0
-        bridge.tick_at(110.0)
-        self.assertEqual(bridge.engine.signals["on_release"], 0)
-        commands.state.slots["s_bmt"].pressure = 5.0
-        bridge.tick_at(120.0)
-        commands.state.slots["s_bmt"].pressure = 45.0
-        bridge.tick_at(130.0)
-        self.assertEqual(bridge.engine.signals["on_release"], 1)
-        self.assertEqual(bridge.engine.signals["punish_strength"], 0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 90, "B": 90})
-
-    def test_crossing_drives_punish_through_cards(self):
-        push = {"name": "推送", "trigger": "period", "arg": 50,
-                "actions": [
-                    {"dir": "in", "param": "in_strength_a", "var": "out"},
-                    {"dir": "in", "param": "in_strength_b", "var": "out"}]}
-        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
-                                    "punish_strength": 120,
-                                    "punish_s": 1.0,
-                                    "temps": [{"name": "out",
-                                               "expr": "max({stim_strength},"
-                                                       " {punish_strength})"}],
-                                    "events": [_TEST_READ, push]},
-                                   commands=_commands(pressure=10.0))
-        bridge.tick_at(100.0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
-        commands.state.slots["s_bmt"].pressure = 45.0
-        bridge.tick_at(110.0)
-        self.assertEqual(_strength_by_channel(commands),
-                         {"A": 120, "B": 120})
-        bridge.tick_at(112.0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 0, "B": 0})
-
     def test_smooth_averages_pressure(self):
-        bridge, commands = _bridge({"smooth": 0.5},
-                                   commands=_commands(pressure=0.0))
+        bridge, commands, ingest = _bridge({"smooth": 0.5}, pressure=0.0)
         bridge.tick_at(100.0)
-        commands.state.slots["s_bmt"].pressure = 30.0
+        ingest.pressure = 30.0
         bridge.tick_at(110.0)
         self.assertAlmostEqual(bridge.engine.signals["pressure"], 15.0)
         bridge.tick_at(120.0)
         self.assertAlmostEqual(bridge.engine.signals["pressure"], 22.5)
 
     def test_no_sensor_stays_idle(self):
-        bridge, commands = _bridge({"ramp_s": 0.0})
-        del commands.state.slots["s_bmt"]
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0})
         bridge.tick_at(100.0)
         self.assertEqual(bridge.engine.signals["stim_strength"], 0)
-        self.assertEqual(commands.strength_calls, [])
+        self.assertEqual(bridge.engine.signals["pressure"], 0)
 
-    def test_pause_zeroes_outputs_via_cards(self):
-        bridge, commands = _bridge({"ramp_s": 0.0},
-                                   commands=_commands(pressure=10.0))
+    def test_values_prefer_published_readings(self):
+        """事件流取值口径：设备读数 < 共享变量 < 模块发布的读数。"""
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0, "smooth": 0.0,
+                                            "leak_comp": 3.0}, pressure=10.0)
+        bridge.engine.temps["my_var"] = 42.0
         bridge.tick_at(100.0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
+        vals = bridge.engine.values()
+        self.assertAlmostEqual(vals["BMTR.Pressure"], 10.0)
+        self.assertEqual(vals["my_var"], 42.0)
+        self.assertAlmostEqual(vals["pressure"], 13.0)
+
+    def test_pause_zeroes_published_strength(self):
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0}, pressure=10.0)
+        bridge.tick_at(100.0)
+        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
         self.assertTrue(bridge.toggle_pause())
         bridge.tick_at(110.0)
         self.assertEqual(bridge.engine.signals["stim_strength"], 0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 0, "B": 0})
+        self.assertEqual(bridge.engine.signals["punish_strength"], 0)
+        self.assertEqual(commands.touched, [])
         self.assertFalse(bridge.toggle_pause())
 
-    def test_no_direct_device_calls_ever(self):
-        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
-                                    "punish_strength": 100,
-                                    "cooldown_s": 0.0,
-                                    "recovery_threshold": 20.0,
-                                    "cycle_limit": 1, "release_s": 1.0},
-                                   commands=_commands(pressure=10.0))
-        for t, p in ((100, 10.0), (110, 45.0), (120, 5.0), (130, 45.0),
-                     (140, 5.0), (150, 5.0), (160, 5.0)):
-            commands.state.slots["s_bmt"].pressure = p
-            bridge.tick_at(t)
-        bridge.toggle_pause()
-        bridge.tick_at(170)
-        self.assertEqual(commands.zap_calls, [])
-        self.assertEqual(commands.fire_calls, [])
-        self.assertEqual(commands.reset_calls, [])
-
-    async def test_stop_zeroes_via_cards(self):
-        bridge, commands = _bridge({"ramp_s": 0.0},
-                                   commands=_commands(pressure=10.0))
+    async def test_stop_zeroes_published_strength(self):
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0}, pressure=10.0)
         await bridge.start()
         bridge.tick_at(100.0)
-        self.assertEqual(_strength_by_channel(commands), {"A": 60, "B": 60})
+        self.assertEqual(bridge.engine.signals["stim_strength"], 60)
         await bridge.stop()
-        self.assertEqual(_strength_by_channel(commands), {"A": 0, "B": 0})
-        self.assertEqual(commands.reset_calls, [])
         self.assertEqual(bridge.engine.signals["stim_strength"], 0)
+        self.assertEqual(bridge.engine.signals["punish_strength"], 0)
+        self.assertEqual(commands.touched, [])
 
     async def test_stop_without_output_change_touches_nothing(self):
-        bridge, commands = _bridge({"mode": "off"})
+        bridge, commands, ingest = _bridge({"mode": "off"})
         await bridge.start()
         await asyncio.sleep(0)
         await bridge.stop()
-        self.assertEqual(commands.strength_calls, [])
-        self.assertEqual(commands.reset_calls, [])
+        self.assertEqual(commands.touched, [])
 
-    async def test_reload_config_hot_swaps_event_cards(self):
-        read_only = {"name": "只读取", "trigger": "period", "arg": 50,
-                     "actions": [{"dir": "out", "param": "BMTR.Pressure",
-                                  "var": "pressure"}]}
-        bridge, commands = _bridge({"ramp_s": 0.0, "smooth": 0.0,
-                                    "events": [_TEST_READ, _TEST_PUSH]},
-                                   commands=_commands(pressure=10.0))
+    async def test_reload_config_does_not_touch_device(self):
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0}, pressure=10.0)
         bridge.tick_at(100.0)
-        self.assertIn(("A", "s_out"),
-                      {(ch, sid) for ch, _v, sid in commands.strength_calls})
-        self.assertIn(("B", "s_out"),
-                      {(ch, sid) for ch, _v, sid in commands.strength_calls})
-        bridge.config["events"] = [read_only,
-                                   {"name": "单通道推送", "trigger": "period",
-                                    "arg": 50,
-                                    "actions": [{"dir": "in",
-                                                 "param": "in_strength_a",
-                                                 "var": "strength_out"}]}]
+        bridge.config["stim_strength"] = 120
         await bridge.reload_config()
-        commands.strength_calls.clear()
-        commands.state.slots["s_bmt"].pressure = 45.0
         bridge.tick_at(110.0)
-        dispatched = {(ch, sid) for ch, _v, sid in commands.strength_calls}
-        self.assertEqual(dispatched, {("A", "s_out")})
-        self.assertEqual(_strength_by_channel(commands), {"A": 100})
+        self.assertEqual(bridge.engine.signals["stim_strength"], 120)
+        self.assertEqual(commands.touched, [])
+
+    def test_board_keeps_host_required_members(self):
+        bridge, commands, ingest = _bridge({}, pressure=10.0)
+        self.assertIsInstance(bridge.engine.signals, dict)
+        self.assertIsInstance(bridge.engine.errors, dict)
+        self.assertIsInstance(bridge.engine.temps, dict)
+        bridge.engine.pump()
+        bridge.engine.signal("pressure", 12.5)
+        self.assertEqual(bridge.engine.signals["pressure"], 12.5)
+        bridge.engine.reset()
+        self.assertEqual(bridge.engine.signals, {})
 
 
 class PluginContractTests(unittest.TestCase):
@@ -823,7 +670,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(meta["id"], "margin_control")
         self.assertEqual(meta["settings_key"], "margin_control")
-        self.assertEqual(meta["version"], "0.12.0")
+        self.assertEqual(meta["version"], "0.13.0")
         self.assertEqual(set(meta["params"]), set(PARAM_DEFS))
         self.assertEqual(set(meta["params"]),
                          {"pressure", "edge", "stim_strength",
@@ -840,8 +687,7 @@ class PluginContractTests(unittest.TestCase):
                     "adapt_stim", "adapt_drop_pct", "adapt_drop_delay_s",
                     "adapt_drop_rate", "adapt_blue_follow", "adapt_cool",
                     "adapt_blue_delay_s", "adapt_blue_rise_rate",
-                    "leak_comp",
-                    "events", "temps"):
+                    "leak_comp"):
             self.assertIn(key, cfg)
         self.assertNotIn("mappings", cfg)
         self.assertNotIn("outputs", cfg)
@@ -861,8 +707,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertIs(cfg["adapt_cool"].get("default"), False)
         self.assertIs(MARGIN_CONFIG_DEFAULTS["adapt_stim"], False)
         self.assertIs(MARGIN_CONFIG_DEFAULTS["adapt_cool"], False)
-        self.assertEqual(meta["actions"],
-                         ["margin_reset_pressure", "margin_guard_toggle"])
+        self.assertEqual(meta["actions"], ["margin_guard_toggle"])
 
     def test_config_defaults_cover_all_declared_keys(self):
         module = MarginControlModule()
@@ -871,37 +716,52 @@ class PluginContractTests(unittest.TestCase):
         for key, item in MARGIN_CONFIG_DEFAULTS.items():
             self.assertIn(key, spec)
 
-    def test_link_params_returns_seven_variables(self):
+    def test_link_params_declare_direction_and_type(self):
         module = MarginControlModule()
-        params = module.link_params()
-        self.assertEqual([name for name, _label in params],
+        rows = module.link_params()
+        self.assertTrue(all(isinstance(row, dict) for row in rows))
+        self.assertEqual([row["name"] for row in rows],
                          ["pressure", "edge", "stim_strength",
                           "punish_strength", "on_edge", "on_release",
                           "cycles"])
+        by = {row["name"]: row for row in rows}
+        # 读数方向：in=宿主可读；pressure/edge 是闭环输入，宿主也要能写
+        self.assertEqual({row["dir"] for name, row in by.items()
+                          if name in ("pressure", "edge")}, {"inout"})
+        self.assertEqual({row["dir"] for name, row in by.items()
+                          if name not in ("pressure", "edge")}, {"in"})
+        self.assertEqual(by["pressure"]["type"], "Float")
+        self.assertEqual(by["on_edge"]["type"], "Bool")
+        self.assertEqual(by["cycles"]["type"], "Int")
+
+    def test_declared_temps_match_params_direction(self):
+        """META["temps"] 的输入声明与 link_params 同向，登记合并后不会退化成只读。"""
+        module = MarginControlModule()
+        by = {row["name"]: row["dir"] for row in module.link_params()}
+        for row in META["temps"]:
+            self.assertEqual(row["dir"], by[row["key"]])
 
     def test_button_actions_registered(self):
         from plugins import ButtonAction
 
         module = MarginControlModule()
         actions = module.button_actions()
-        self.assertEqual([a.key for a in actions],
-                         ["margin_reset_pressure", "margin_guard_toggle"])
+        self.assertEqual([a.key for a in actions], ["margin_guard_toggle"])
         self.assertTrue(all(isinstance(a, ButtonAction) for a in actions))
         self.assertTrue(all(callable(a.on_press) for a in actions))
 
-    def test_no_builtin_fallback_rows(self):
-        bridge, commands = _bridge({"ramp_s": 0.0},
-                                   commands=_commands(pressure=10.0))
+    def test_no_builtin_dispatch_rows(self):
+        bridge, commands, ingest = _bridge({"ramp_s": 0.0}, pressure=10.0)
         bare = MarginBridge(MarginConfig({}), commands.get_state, commands)
         bare.log = lambda msg: None
         self.assertEqual(bare.engine.mappings, {})
         self.assertEqual(bare.engine.outputs, [])
-        self.assertFalse(bare.engine.has_events())
+        self.assertEqual(bare.engine.out_values, {})
         bare._clock = lambda: 100.0
+        bare.ingest = _Ingest(bare)
         bare._tick()
         self.assertEqual(bare.engine.temps, {})
-        self.assertEqual(bare.engine.out_values, {})
-        self.assertEqual(commands.strength_calls, [])
+        self.assertEqual(commands.touched, [])
 
     def test_module_class_attributes(self):
         module = MarginControlModule()
@@ -912,14 +772,113 @@ class PluginContractTests(unittest.TestCase):
 
     def test_button_press_without_start_is_safe(self):
         module = MarginControlModule()
-        module.on_load(type("Ctx", (), {
-            "log": staticmethod(lambda msg: None),
-            "submit": staticmethod(lambda coro: None),
-            "engine": None,
-            "settings": {},
-        })())
+        module.on_load(_Ctx(state=EngineState(backend="ble")))
         module._press_guard_toggle(None, None)
         module.on_unload()
+
+    def test_legacy_dispatch_settings_dropped_with_one_log(self):
+        from modules.margin_control.plugin import drop_mapping_tables
+
+        settings = {"events": [{"name": "强度推送", "trigger": "period",
+                                "arg": 50, "actions": []}],
+                    "temps": [{"name": "strength_out",
+                               "expr": "max({stim_strength},{punish_strength})"}],
+                    "mappings": [], "outputs": [],
+                    "edge_threshold": 17.0}
+        logs: list[str] = []
+        self.assertTrue(drop_mapping_tables(settings, logs.append))
+        for key in ("events", "temps", "mappings", "outputs"):
+            self.assertNotIn(key, settings)
+        self.assertEqual(settings["edge_threshold"], 17.0)
+        self.assertEqual(len(logs), 1)
+        self.assertIn("事件流", logs[0])
+        self.assertFalse(drop_mapping_tables(settings, logs.append))
+        self.assertEqual(len(logs), 1)
+
+
+class _Ctx:
+    """宿主 ModuleContext 桩：十个被拦方法 + reset_pressure 一律抛错。"""
+
+    def __init__(self, state: EngineState | None = None):
+        self.state = state or EngineState(backend="ble", connected=True,
+                                          paired=True)
+        self.settings: dict = {}
+        self.logs: list[str] = []
+        self.events = _Events()
+        self.engine = NeverCommands()
+        self.touched: list[str] = []
+
+    def log(self, msg: str) -> None:
+        self.logs.append(msg)
+
+    def get_state(self):
+        return self.state
+
+    def submit(self, coro):
+        coro.close()
+        return None
+
+    def set_temp(self, key, value) -> None:
+        return None
+
+    def resolve_slot(self, slot_id=None, family=None, output_only=False):
+        return None
+
+
+class _Events:
+    def on(self, *args):
+        pass
+
+    def off(self, *args):
+        pass
+
+    def emit(self, event, *args):
+        pass
+
+
+def _ctx_guard(name: str):
+    def _raise(self, *args, **kwargs):
+        self.touched.append(name)
+        raise DeviceTamper(f"模块直写设备被调用：{name}()")
+    return _raise
+
+
+for _name in BLOCKED_METHODS:
+    setattr(_Ctx, _name, _ctx_guard(_name))
+
+
+class GuardModuleCycleTests(unittest.IsolatedAsyncioTestCase):
+    """守门用例：一个会对设备写入抛错的宿主桩要撑过模块的完整生命周期。"""
+
+    async def test_full_module_cycle_never_touches_device(self):
+        ctx = _Ctx()
+        mod = MarginControlModule()
+        mod.on_load(ctx)
+        await mod.start()
+        try:
+            bridge = mod.bridge
+            self.assertTrue(bridge.is_running() if hasattr(bridge, "is_running")
+                            else bridge._running)
+            bridge.ingest = _Ingest(bridge)
+            bridge.tick_at = lambda t: _advance(bridge, t)
+            for t, p in ((100.0, 10.0), (110.0, 45.0), (120.0, 5.0),
+                         (130.0, 45.0), (140.0, 5.0), (150.0, 45.0)):
+                bridge.ingest.pressure = p
+                bridge.tick_at(t)
+            bridge.toggle_pause()
+            bridge.tick_at(160.0)
+            bridge.toggle_pause()
+            bridge.tick_at(170.0)
+            await mod.reload_config()
+            self.assertIn("stim_strength", bridge.engine.signals)
+            self.assertEqual(ctx.touched, [])
+            self.assertEqual(ctx.engine.touched, [])
+            for row in mod.link_params():
+                self.assertIn(row["dir"], ("in", "out", "inout"))
+        finally:
+            await mod.stop()
+            mod.on_unload()
+        self.assertEqual(ctx.touched, [])
 
 
 if __name__ == "__main__":

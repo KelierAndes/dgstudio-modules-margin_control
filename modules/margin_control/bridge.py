@@ -6,10 +6,8 @@ import time
 import traceback
 from typing import Any, Callable
 
-from dglab.mapping import MappingEngine, event_cards
-from dglab.params import (build_dispatchers, core_alias_values, core_inputs,
-                          device_state_values, input_ranges)
-from dglab.state import family_of
+from dglab.mapping import as_number
+from dglab.params import core_alias_values, device_state_values
 
 __all__ = ["MarginBridge", "MarginConfig", "EdgeGuard", "PARAM_DEFS",
            "PHASE_IDLE", "PHASE_STIM", "PHASE_COOL", "PHASE_RELEASE",
@@ -317,12 +315,70 @@ class EdgeGuard:
                 and (now - self.session_since) >= time_release)
 
 
+class _SignalBoard:
+    """闭环的变量面板：模块只登记读数，不派发设备。
+
+    宿主按 ``bridge.engine`` 取实时值（``plugins._mapping_engine`` 的兼容挂表、
+    ``flow_host.module_signals`` 的事件流读数、``ui/live.py`` 的概览），需要的是
+    ``signals`` / ``errors`` / ``pump()`` 三件。``temps`` 由宿主
+    ``apply_logic_tables()`` 换成**全局共享变量表**：事件流的「写入变量」卡片把
+    ``BMTR.Pressure`` / ``BMTR.EdgeState`` 写成 ``pressure`` / ``edge``，
+    闭环每拍就从这里取输入。
+
+    原来的派发层（``MappingEngine`` + ``build_dispatchers`` + ``_DeviceApi`` +
+    模块内事件卡片）随「模块不许直写设备」的新规整体移除：刺激 / 惩罚强度改由
+    事件流的写入卡片读 ``{stim_strength}`` / ``{punish_strength}`` 两个变量落地。
+    ``mappings`` / ``outputs`` 等映射表时代的属性只作为恒空兼容位保留，
+    ``ui/live.py`` 的通道概览仍会直接读它们。
+    """
+
+    def __init__(self, device_vars: Callable[[], dict[str, float]] | None = None):
+        self._device_vars = device_vars or (lambda: {})
+        self.signals: dict[str, float] = {}
+        self.errors: dict[str, str] = {}
+        self.temps: dict[str, float] = {}
+        self.last_values: dict[str, float] = {}
+        self.mappings: dict[str, str] = {}
+        self.outputs: list[dict[str, Any]] = []
+        self.out_values: dict[str, Any] = {}
+        self.out_errors: dict[str, str] = {}
+
+    def signal(self, name: str, value: Any) -> None:
+        num = as_number(value)
+        if num is None:
+            return
+        self.signals[str(name)] = num
+
+    def values(self) -> dict[str, float]:
+        """取值口径：设备读数 < 共享变量 < 本模块发布的读数（与旧映射引擎一致）。"""
+        merged = self._device_vars()
+        for key, value in self.temps.items():
+            merged.setdefault(str(key), value)
+        merged.update(self.signals)
+        return merged
+
+    def attach_temps(self, shared: dict[str, float]) -> None:
+        if shared is not self.temps:
+            shared.update(self.temps)
+            self.temps = shared
+
+    def pump(self) -> None:
+        return None
+
+    def reset(self) -> None:
+        self.signals.clear()
+        self.errors.clear()
+        self.last_values.clear()
+
+
 class MarginBridge:
 
     def __init__(self, config: MarginConfig, get_state: Callable[[], Any],
-                 commands: Any, events=None):
+                 commands: Any = None, events=None):
         self.config = config
         self.get_state = get_state
+        # 设备命令入口只为老调用点保留，闭环不再碰它：模块直写设备已被宿主拦下，
+        # 强度落地改由事件流的写入卡片读 {stim_strength} / {punish_strength}。
         self.commands = commands
 
         self.log: Callable[[str], None] = print
@@ -340,36 +396,11 @@ class MarginBridge:
         self._last_phase: int = PHASE_IDLE
         self.last_values: dict[str, float] = {}
 
-        self.engine = MappingEngine(self._dispatch,
-                                    device_vars=self._device_vars,
-                                    ranges=input_ranges())
-        self.engine.armed = False
-        self._api = self._DeviceApi(self)
-        self.dispatchers = build_dispatchers(self._api, core_inputs())
-        self.apply_config()
-
+        self.engine = _SignalBoard(self._device_vars)
 
     def apply_config(self) -> None:
-        self._seed_temps()
-        self.engine.set_temp_rows(self.config.get("temps") or [])
-        rows = self.config.get("events") or []
-        self.engine.set_event_cards(rows)
-        self._push_cards = [card for card in event_cards(rows)
-                            if any(act["dir"] == "in"
-                                   for act in card["actions"])]
-
-    def _seed_temps(self) -> None:
-        for temp in self.config.get("temps") or []:
-            if not isinstance(temp, dict):
-                continue
-            name = str(temp.get("name") or "").strip()
-            if not name or "expr" in temp:
-                continue
-            try:
-                value = float(temp.get("value") or 0.0)
-            except (TypeError, ValueError):
-                value = 0.0
-            self.engine.temps.setdefault(name, value)
+        """派发层已移除：闭环每拍直读 ``self.config``，这里没有要装载的表。"""
+        return None
 
     def _safe_state(self):
         try:
@@ -381,69 +412,6 @@ class MarginBridge:
         vals = device_state_values(self._safe_state())
         vals.update(core_alias_values(vals))
         return vals
-
-    def _dispatch(self, target: str, value: int) -> None:
-        runner = self.dispatchers.get(target)
-        if runner is None:
-            return
-        try:
-            runner(value)
-        except Exception as exc:
-            self.log(f"事件流派发 {target}={value} 失败: {exc!r}")
-
-    class _DeviceApi:
-
-        def __init__(self, bridge: "MarginBridge"):
-            self._b = bridge
-
-        @property
-        def _cmd(self):
-            return self._b.commands
-
-        def resolve_slot(self, family: str = "") -> str | None:
-            state = self._b._safe_state()
-            if state is None:
-                return None
-            slots = state.slots or {}
-            if family:
-                for sid in sorted(slots):
-                    if family_of(slots[sid].type) == family:
-                        return sid
-                return None
-            for sid in sorted(slots):
-                if family_of(slots[sid].type) != "BMTR":
-                    return sid
-            return None
-
-        def wave_order(self, family: str = "") -> list[str]:
-            from dglab.waves import wave_order
-            return wave_order(family or "COYOTE")
-
-        def wave_selection(self) -> dict:
-            getter = getattr(self._cmd, "wave_selection", None)
-            return (getter() or {}) if getter is not None else {}
-
-        def set_strength(self, channel, value, slot_id=None):
-            return self._cmd.set_strength(channel, value, slot_id=slot_id)
-
-        def set_wave(self, channel, name, slot_id=None):
-            return self._cmd.set_wave(channel, name, slot_id=slot_id)
-
-        def zap(self, channel, seconds=1.0, slot_id=None):
-            return self._cmd.zap(channel, seconds, slot_id=slot_id)
-
-        def fire_start(self, slot_id=None, channel=None):
-            return self._cmd.fire_start(slot_id=slot_id, channel=channel)
-
-        def fire_stop(self, slot_id=None, channel=None):
-            return self._cmd.fire_stop(slot_id=slot_id, channel=channel)
-
-        def emergency_stop(self):
-            return self._cmd.emergency_stop()
-
-        def run(self, coro) -> None:
-            self._b._spawn(coro)
-
 
     async def start(self) -> None:
         if self._running:
@@ -464,16 +432,8 @@ class MarginBridge:
         self.guard.reset(self._clock())
         self.engine.signal("stim_strength", 0)
         self.engine.signal("punish_strength", 0)
-        self._fire_push_cards()
         self._refresh_last_values()
         self.log("灵猫边控联动已停止")
-
-    def _fire_push_cards(self) -> None:
-        for card in self._push_cards:
-            try:
-                self.engine.fire_card(card)
-            except Exception as exc:
-                self.log(f"停止归零推送失败: {exc!r}")
 
     def close(self) -> None:
         self._running = False
@@ -545,7 +505,6 @@ class MarginBridge:
         self.engine.signal("on_release",
                            1 if self.guard.phase == PHASE_RELEASE else 0)
         self.engine.signal("cycles", self.guard.cycles)
-        self.engine.armed = True
         self._refresh_last_values()
 
     def _refresh_last_values(self) -> None:
@@ -583,20 +542,6 @@ class MarginBridge:
         else:
             self.log("灵猫气压无有效读数（归零/失联/读数冻结），"
                      "闭环归零待机中")
-
-    def _spawn(self, coro) -> None:
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            coro.close()
-            return
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            loop.create_task(coro)
-        else:
-            asyncio.run_coroutine_threadsafe(coro, loop)
 
     def _log_error(self, prefix: str) -> None:
         self.log(f"{prefix}:\n{traceback.format_exc()}")

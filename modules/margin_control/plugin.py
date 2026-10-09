@@ -2,37 +2,45 @@
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.12.0",
+    "version": "0.13.0",
     "description": "灵猫气压 / 官方边控会话 → 闭环边控（事件流数据面）："
-                   "事件流「输出」动作把 BMTR.Pressure/EdgeState 推入模块"
-                   "变量，闭环判定后经「输入」动作推送强度，零内置兜底链路；"
-                   "达限后的下一次到边即释放边（不惩罚、刺激器=助力、循环"
-                   "置零）。",
+                   "事件流把 BMTR.Pressure/EdgeState 写入模块变量，闭环判定后"
+                   "发布刺激/惩罚强度等变量，设备动作由事件流的写入卡片驱动，"
+                   "模块自身不下发设备命令；达限后的下一次到边即释放边（不惩罚、"
+                   "刺激器=助力、循环置零）。",
     "settings_key": "margin_control",
     "default_enabled": False,
-    "actions": ["margin_reset_pressure", "margin_guard_toggle"],
+    "actions": ["margin_guard_toggle"],
     "params": {
-        "pressure": {"label": "灵猫气压", "desc": "平滑 + 漏气补偿后气压 (kPa)"},
+        "pressure": {"label": "灵猫气压", "desc": "平滑 + 漏气补偿后气压 (kPa)",
+                     "dir": "inout", "type": "Float"},
         "edge": {"label": "官方边控状态", "desc": "App 边控会话 0-4：0 停止 / "
-                                                "1 刺激 / 2 冷静计时 / 3 冷静判定 / 4 允许高潮"},
+                                                "1 刺激 / 2 冷静计时 / 3 冷静判定 / 4 允许高潮",
+                 "dir": "inout", "type": "Int"},
         "stim_strength": {"label": "刺激器强度", "desc": "刺激期按爬升时长趋向"
                                                        "刺激强度，冷静期维持冷静强度，释放期输出"
-                                                       "助力强度，其余 0（0-200）"},
+                                                       "助力强度，其余 0（0-200）",
+                          "dir": "in", "type": "Int"},
         "punish_strength": {"label": "惩罚器强度", "desc": "到边进冷静后的惩罚"
-                                                         "输出，惩罚时长内非零（0-200）"},
+                                                         "输出，惩罚时长内非零（0-200）",
+                            "dir": "in", "type": "Int"},
         "on_edge": {"label": "到边标志", "desc": "气压 ≥ 当前边缘阈值（自适应后"
-                                                "红线）时为 1"},
+                                                "红线）时为 1",
+                    "dir": "in", "type": "Bool"},
         "on_release": {"label": "释放标志", "desc": "释放期（允许高潮，助力输出）"
-                                                  "为 1，其余 0"},
+                                                  "为 1，其余 0",
+                       "dir": "in", "type": "Bool"},
         "cycles": {"label": "边控循环", "desc": "当前轮「到边→冷静」计数；释放完成"
-                                              "后清零重新计"},
+                                              "后清零重新计",
+                   "dir": "in", "type": "Int"},
     },
     "temps": [
-        {"key": "pressure", "label": "灵猫气压读数",
-         "desc": "事件流「输出」动作 BMTR.Pressure → pressure 写入的原始"
-                 "气压 (kPa)，闭环判定与平滑以此为输入"},
-        {"key": "edge", "label": "官方边控状态读数",
-         "desc": "事件流「输出」动作 BMTR.EdgeState → edge 写入的会话状态 "
+        {"key": "pressure", "label": "灵猫气压读数", "dir": "inout",
+         "type": "Float",
+         "desc": "事件流的写入卡片把 BMTR.Pressure 写进 pressure 作为原始"
+                 "气压 (kPa) 输入；模块读出的同名变量是平滑 + 漏气补偿后的值"},
+        {"key": "edge", "label": "官方边控状态读数", "dir": "inout", "type": "Int",
+         "desc": "事件流的写入卡片把 BMTR.EdgeState 写进 edge 的会话状态 "
                  "0-4（app 模式输入）"},
     ],
     "config": {
@@ -217,24 +225,6 @@ META = {
             "desc": "叠加到气压读数上的固定补偿（腔体漏气读数偏低时调大；"
                     "官方默认 3）",
         },
-        "events": {
-            "label": "事件流卡片", "type": "list",
-            "default": [], "group": "map",
-            "desc": "卡片 {name, trigger, arg, actions: [{dir, param, "
-                    "var}]}：「输出」动作把核心输出信号读入模块变量"
-                    "（BMTR.Pressure → pressure、BMTR.EdgeState → edge），"
-                    "「输入」动作把 {stim_strength} {punish_strength} 等变量"
-                    "值推送到核心输入参数（in_* 郊狼、in_ovc_* 负鼠）。"
-                    "动作内不做运算，组合（如 max(刺激, 惩罚)）写在临时变量",
-        },
-        "temps": {
-            "label": "临时变量", "type": "list", "default": [],
-            "group": "map",
-            "desc": "行 {name, expr} 每次映射重算按序求值（如 strength_out "
-                    "← max({stim_strength}, {punish_strength})，供「输入」"
-                    "动作引用），{name, value} 为静态初值；pressure/edge 由"
-                    "模块声明并维护，事件流「输出」动作写入",
-        },
     },
 }
 
@@ -245,6 +235,9 @@ from modules.margin_control.bridge import (PARAM_DEFS, MarginBridge,
                                            MarginConfig)
 
 MARGIN_CONFIG_DEFAULTS = spec_defaults(META["config"])
+
+# 模块内派发层时代的设置项：换算与设备写入已全部交给宿主的「事件流」画布
+_LEGACY_KEYS = ("events", "temps", "mappings", "outputs")
 
 
 class MarginControlModule(ModuleBase):
@@ -261,12 +254,17 @@ class MarginControlModule(ModuleBase):
     def config_spec(self) -> dict:
         return dict(META["config"])
 
-    def link_params(self) -> list[tuple[str, str]]:
-        return [(name, str(item.get("label") or ""))
-                for name, item in PARAM_DEFS.items()]
+    def link_params(self) -> list[dict]:
+        """闭环发布 / 采样的变量：方向与值类型显式声明，宿主据此决定可否写入。"""
+        return [{"name": name, "label": str(item.get("label") or name),
+                 "dir": str(item.get("dir") or "in"),
+                 "type": str(item.get("type") or "Float"),
+                 "desc": str(item.get("desc") or "")}
+                for name, item in META["params"].items()]
 
     def on_load(self, ctx) -> None:
         self.ctx = ctx
+        drop_mapping_tables(ctx.settings, ctx.log)
 
     def on_unload(self) -> None:
         if self.bridge is not None:
@@ -284,8 +282,7 @@ class MarginControlModule(ModuleBase):
                 pass
         self.bridge = MarginBridge(
             MarginConfig(self.ctx.settings, defaults=MARGIN_CONFIG_DEFAULTS),
-            self.ctx.engine.get_state,
-            self.ctx.engine,
+            self.ctx.get_state,
             events=self.ctx.events,
         )
         self.bridge.log = self.ctx.log
@@ -307,22 +304,13 @@ class MarginControlModule(ModuleBase):
         return self.bridge is not None and bool(getattr(self.bridge,
                                                         "_running", False))
 
-
     def button_actions(self) -> list:
         from plugins import ButtonAction
 
         return [
-            ButtonAction("margin_reset_pressure", "灵猫气压清零",
-                         on_press=self._press_reset_pressure),
             ButtonAction("margin_guard_toggle", "边控闭环 暂停/恢复",
                          on_press=self._press_guard_toggle),
         ]
-
-    def _press_reset_pressure(self, slot_id, argument) -> None:
-        if self.ctx is None:
-            return
-        fut = self.ctx.submit(self.ctx.engine.reset_pressure())
-        fut.add_done_callback(self._log_future)
 
     def _press_guard_toggle(self, slot_id, argument) -> None:
         if self.ctx is None:
@@ -332,7 +320,17 @@ class MarginControlModule(ModuleBase):
             return
         self.bridge.toggle_pause()
 
-    def _log_future(self, fut) -> None:
-        exc = fut.exception()
-        if exc is not None and self.ctx is not None:
-            self.ctx.log(f"气压清零失败: {exc!r}")
+
+def drop_mapping_tables(settings: dict, log=None) -> bool:
+    """清除模块派发层时代的设置项：接线改在「事件流」画布里完成。"""
+    stale = [key for key in _LEGACY_KEYS if key in settings]
+    if not stale:
+        return False
+    for key in stale:
+        settings.pop(key, None)
+    if log is not None:
+        log("模块内的派发层已移除，遗留设置项（" + "、".join(stale) +
+            "）已清除：气压 / 边控状态请用事件流的写入卡片写入 pressure / edge，"
+            "刺激与惩罚强度请读 {stim_strength} {punish_strength} 变量驱动设备")
+    return True
+
