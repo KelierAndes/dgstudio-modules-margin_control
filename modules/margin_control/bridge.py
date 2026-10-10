@@ -452,13 +452,18 @@ class MarginBridge:
 
 
     async def _tick_loop(self) -> None:
+        last_error_log = float("-inf")
         try:
             while self._running:
                 await asyncio.sleep(TICK_S)
                 try:
                     self._tick()
                 except Exception:
-                    self._log_error("边控节拍失败")
+                    # 持续异常时限流：日志页每条都全量重建，0.1s 一栈会卡死
+                    now = time.monotonic()
+                    if now - last_error_log >= 30.0:
+                        last_error_log = now
+                        self._log_error("边控节拍失败")
         except asyncio.CancelledError:
             pass
 
