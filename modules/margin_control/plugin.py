@@ -2,7 +2,7 @@
 META = {
     "id": "margin_control",
     "name": "灵猫边控联动",
-    "version": "0.13.0",
+    "version": "0.13.1",
     "description": "灵猫气压 / 官方边控会话 → 闭环边控（事件流数据面）："
                    "事件流把 BMTR.Pressure/EdgeState 写入模块变量，闭环判定后"
                    "发布刺激/惩罚强度等变量，设备动作由事件流的写入卡片驱动，"

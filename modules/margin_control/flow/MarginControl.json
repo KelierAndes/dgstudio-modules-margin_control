@@ -1,0 +1,256 @@
+{
+  "version": 3,
+  "name": "MarginControl",
+  "saved_at": "2026-10-11 01:41:15",
+  "graphs": {
+    "input": {
+      "page": "input",
+      "nodes": [
+        {
+          "id": "i137",
+          "def": "mod.period",
+          "x": 523.9765625,
+          "y": 40.0,
+          "params": {
+            "period_ms": 50,
+            "var": ""
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i138",
+          "def": "mod.read.margin_control.punish_strength",
+          "x": 271.51953125,
+          "y": 40.0,
+          "params": {
+            "module": "margin_control",
+            "name": "punish_strength"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i139",
+          "def": "mod.read.margin_control.stim_strength",
+          "x": 271.51953125,
+          "y": 117.0,
+          "params": {
+            "module": "margin_control",
+            "name": "stim_strength"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i140",
+          "def": "core.write.in_strength_a",
+          "x": 40.0,
+          "y": 40.0,
+          "params": {
+            "key": "in_strength_a"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i141",
+          "def": "core.write.in_strength_b",
+          "x": 40.0,
+          "y": 117.0,
+          "params": {
+            "key": "in_strength_b"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i142",
+          "def": "core.write.in_ovc_strength_a",
+          "x": 40.0,
+          "y": 194.0,
+          "params": {
+            "key": "in_ovc_strength_a"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "i143",
+          "def": "core.write.in_ovc_strength_b",
+          "x": 40.0,
+          "y": 271.0,
+          "params": {
+            "key": "in_ovc_strength_b"
+          },
+          "alias": "",
+          "overrides": {}
+        }
+      ],
+      "wires": [
+        {
+          "id": "iw144",
+          "src": [
+            "i137",
+            0
+          ],
+          "dst": [
+            "i140",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw145",
+          "src": [
+            "i137",
+            0
+          ],
+          "dst": [
+            "i141",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw146",
+          "src": [
+            "i137",
+            0
+          ],
+          "dst": [
+            "i142",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw147",
+          "src": [
+            "i137",
+            0
+          ],
+          "dst": [
+            "i143",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "iw148",
+          "src": [
+            "i138",
+            0
+          ],
+          "dst": [
+            "i140",
+            0
+          ],
+          "type": "int"
+        },
+        {
+          "id": "iw149",
+          "src": [
+            "i138",
+            0
+          ],
+          "dst": [
+            "i141",
+            0
+          ],
+          "type": "int"
+        },
+        {
+          "id": "iw150",
+          "src": [
+            "i139",
+            0
+          ],
+          "dst": [
+            "i142",
+            0
+          ],
+          "type": "int"
+        },
+        {
+          "id": "iw151",
+          "src": [
+            "i139",
+            0
+          ],
+          "dst": [
+            "i143",
+            0
+          ],
+          "type": "int"
+        }
+      ]
+    },
+    "output": {
+      "page": "output",
+      "nodes": [
+        {
+          "id": "o43",
+          "def": "mod.period",
+          "x": 40.0,
+          "y": 40.0,
+          "params": {
+            "period_ms": 50,
+            "var": ""
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "o44",
+          "def": "core.read.BMTR.Pressure",
+          "x": 222.0,
+          "y": 40.0,
+          "params": {
+            "key": "BMTR.Pressure"
+          },
+          "alias": "",
+          "overrides": {}
+        },
+        {
+          "id": "o45",
+          "def": "mod.write.margin_control.pressure",
+          "x": 440.0,
+          "y": 40.0,
+          "params": {
+            "module": "margin_control",
+            "name": "pressure"
+          },
+          "alias": "",
+          "overrides": {}
+        }
+      ],
+      "wires": [
+        {
+          "id": "ow46",
+          "src": [
+            "o43",
+            0
+          ],
+          "dst": [
+            "o45",
+            -1
+          ],
+          "type": "exec"
+        },
+        {
+          "id": "ow47",
+          "src": [
+            "o44",
+            0
+          ],
+          "dst": [
+            "o45",
+            0
+          ],
+          "type": "float"
+        }
+      ]
+    }
+  }
+}
